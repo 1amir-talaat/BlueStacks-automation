@@ -302,6 +302,10 @@ class BaseApp:
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: Daily limit dialog detected at ({cx},{cy})")
                 return AppState.DAILY_LIMIT
 
+        if self._is_in_app_ad_overlay(frame):
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: In-app ad overlay detected")
+            return AppState.AD_PLAYING
+
         if self._is_blocking_loading_dialog(frame):
             self._last_loading_seen_at = time.time()
             logger.info(f"[{self.adb.name}] {self.APP_NAME}: Loading dialog detected")
@@ -462,6 +466,37 @@ class BaseApp:
             return False
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return any(cv2.contourArea(c) > 200 for c in contours)
+
+    def _is_in_app_ad_overlay(self, frame) -> bool:
+        """Detect ad webviews that keep focus inside the app package."""
+        import cv2
+        import numpy as np
+
+        h, w = frame.shape[:2]
+
+        top_bar = frame[0:int(h * 0.06), int(w * 0.10):int(w * 0.98)]
+        ad_badge = frame[int(h * 0.055):int(h * 0.095), 0:int(w * 0.35)]
+        if top_bar.size == 0 or ad_badge.size == 0:
+            return False
+
+        top_gray = cv2.cvtColor(top_bar, cv2.COLOR_BGR2GRAY)
+        top_bright_ratio = cv2.countNonZero(cv2.inRange(top_gray, 185, 255)) / max(1, top_gray.size)
+
+        badge_hsv = cv2.cvtColor(ad_badge, cv2.COLOR_BGR2HSV)
+        badge_gray = cv2.inRange(badge_hsv, np.array([0, 0, 90]), np.array([180, 70, 190]))
+        badge_ratio = cv2.countNonZero(badge_gray) / max(1, badge_gray.size)
+
+        top_right = frame[0:int(h * 0.07), int(w * 0.65):w]
+        top_right_hsv = cv2.cvtColor(top_right, cv2.COLOR_BGR2HSV)
+        top_blue = cv2.inRange(top_right_hsv, np.array([95, 70, 90]), np.array([135, 255, 255]))
+
+        bottom = frame[int(h * 0.72):h, int(w * 0.05):int(w * 0.95)]
+        bottom_hsv = cv2.cvtColor(bottom, cv2.COLOR_BGR2HSV)
+        bottom_blue = cv2.inRange(bottom_hsv, np.array([95, 70, 90]), np.array([135, 255, 255]))
+
+        has_ad_chrome = top_bright_ratio > 0.45 and badge_ratio > 0.12
+        has_ad_action = cv2.countNonZero(top_blue) > 25 or cv2.countNonZero(bottom_blue) > 1500
+        return has_ad_chrome and has_ad_action
 
     def _is_blocking_loading_dialog(self, frame) -> bool:
         return self._is_loading_dialog(frame) and self._is_ad_page_behind_loading(frame)
@@ -1175,55 +1210,59 @@ class BaseApp:
                 continue
 
             if focus_state == "ours":
-                # Back to our app — look for reward dialog
-                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Focus returned after {elapsed:.0f}s")
-                time.sleep(2)
+                frame = self._get_frame()
+                if frame is not None and self._is_in_app_ad_overlay(frame):
+                    focus_state = "ad"
+                else:
+                    # Back to our app — look for reward dialog
+                    logger.info(f"[{self.adb.name}] {self.APP_NAME}: Focus returned after {elapsed:.0f}s")
+                    time.sleep(2)
 
-                # Check reward FIRST — it sits on top of daily limit dialog
-                if self._tap_reward_ok(timeout=6):
+                    # Check reward FIRST — it sits on top of daily limit dialog
+                    if self._tap_reward_ok(timeout=6):
+                        self.ads_watched += 1
+                        self._record_ad_load_success()
+                        self.post_ad_loading_retries = 0
+                        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad #{self.ads_watched} collected!")
+                        return
+
+                    state = self.detect_state()
+                    if state in (AppState.REWARD_RECEIVED, AppState.REWARD_GRANTED):
+                        self.collect_reward()
+                        return
+
+                    if state == AppState.DAILY_LIMIT:
+                        return self.handle_daily_limit()
+
+                    if state == AppState.LOADING_DIALOG:
+                        self.post_ad_loading_retries += 1
+                        if self.post_ad_loading_retries >= 2:
+                            logger.warning(
+                                f"[{self.adb.name}] {self.APP_NAME}: Loading dialog after ad detected twice; "
+                                "switching app"
+                            )
+                            self.post_ad_loading_retries = 0
+                            self._in_post_ad_retry = False
+                            return "date_trick_blocked"
+                        logger.info(
+                            f"[{self.adb.name}] {self.APP_NAME}: Loading dialog after ad; "
+                            "returning to main loop (1/2)"
+                        )
+                        return
+
+                    if state == AppState.AD_PAGE:
+                        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad finished, back on ad page")
+                        return
+
+                    # Fallback: we just came back from ad, assume reward — tap OK position
+                    logger.info(f"[{self.adb.name}] {self.APP_NAME}: Tapping OK position (fallback)")
+                    self.adb.tap(*self.OK_BTN)
+                    time.sleep(2)
                     self.ads_watched += 1
                     self._record_ad_load_success()
                     self.post_ad_loading_retries = 0
                     logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad #{self.ads_watched} collected!")
                     return
-
-                state = self.detect_state()
-                if state in (AppState.REWARD_RECEIVED, AppState.REWARD_GRANTED):
-                    self.collect_reward()
-                    return
-
-                if state == AppState.DAILY_LIMIT:
-                    return self.handle_daily_limit()
-
-                if state == AppState.LOADING_DIALOG:
-                    self.post_ad_loading_retries += 1
-                    if self.post_ad_loading_retries >= 2:
-                        logger.warning(
-                            f"[{self.adb.name}] {self.APP_NAME}: Loading dialog after ad detected twice; "
-                            "switching app"
-                        )
-                        self.post_ad_loading_retries = 0
-                        self._in_post_ad_retry = False
-                        return "date_trick_blocked"
-                    logger.info(
-                        f"[{self.adb.name}] {self.APP_NAME}: Loading dialog after ad; "
-                        "returning to main loop (1/2)"
-                    )
-                    return
-
-                if state == AppState.AD_PAGE:
-                    logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad finished, back on ad page")
-                    return
-
-                # Fallback: we just came back from ad, assume reward — tap OK position
-                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Tapping OK position (fallback)")
-                self.adb.tap(*self.OK_BTN)
-                time.sleep(2)
-                self.ads_watched += 1
-                self._record_ad_load_success()
-                self.post_ad_loading_retries = 0
-                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad #{self.ads_watched} collected!")
-                return
 
             # Still in ad — look for X or Continue button to skip
             if self.buttons.available:
