@@ -308,6 +308,10 @@ class BaseApp:
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: Daily limit dialog detected at ({cx},{cy})")
                 return AppState.DAILY_LIMIT
 
+        if self._find_in_app_redirect_continue(frame):
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: In-app redirect overlay detected")
+            return AppState.AD_PLAYING
+
         if self._is_in_app_ad_overlay(frame):
             logger.info(f"[{self.adb.name}] {self.APP_NAME}: In-app ad overlay detected")
             return AppState.AD_PLAYING
@@ -890,6 +894,85 @@ class BaseApp:
             self.adb.launch_app(self.PACKAGE_NAME, self.ACTIVITY_NAME)
             time.sleep(3)
 
+    def _find_in_app_redirect_continue(self, frame) -> tuple[int, int] | None:
+        """Detect Play-style in-app redirect overlays with a top Continue-to-app bar."""
+        import cv2
+        import numpy as np
+
+        h, w = frame.shape[:2]
+        if h < 600 or w < 300:
+            return None
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # The overlay in the reported screenshot has a large Google-blue Install
+        # CTA near the bottom. This keeps the detector from firing on normal ads.
+        bottom = hsv[int(h * 0.82):int(h * 0.97), int(w * 0.05):int(w * 0.95)]
+        blue = cv2.inRange(bottom, np.array([95, 90, 90]), np.array([125, 255, 255]))
+        blue_pixels = cv2.countNonZero(blue)
+        if blue_pixels < int(w * h * 0.015):
+            return None
+
+        # The top bar is mostly white/light gray and contains a small blue arrow
+        # on the right. Tap the arrow area to return to the app immediately.
+        top = hsv[0:int(h * 0.08), :]
+        white = cv2.inRange(top, np.array([0, 0, 180]), np.array([180, 55, 255]))
+        if cv2.countNonZero(white) < int(w * h * 0.035):
+            return None
+
+        right_top = hsv[0:int(h * 0.08), int(w * 0.75):w]
+        arrow_blue = cv2.inRange(right_top, np.array([95, 80, 80]), np.array([125, 255, 255]))
+        if cv2.countNonZero(arrow_blue) < 20:
+            return None
+
+        return (int(w * 0.92), int(h * 0.035))
+
+    def _dismiss_in_app_redirect_overlay(self, frame=None) -> bool:
+        if frame is None:
+            frame = self._get_frame()
+        if frame is None:
+            return False
+
+        target = self._find_in_app_redirect_continue(frame)
+        if not target:
+            return False
+
+        logger.info(f"[{self.adb.name}] {self.APP_NAME}: In-app redirect overlay detected, tapping Continue to app at {target}")
+        self.adb.tap(*target)
+        time.sleep(1)
+        return True
+
+    def _guarded_watch_now_taps(self, x: int, y: int, tap_count: int) -> str:
+        """Tap Watch Now quickly, but stop as soon as the ad/redirect opens."""
+        for index in range(tap_count):
+            self.adb.tap(x, y)
+            if index == tap_count - 1:
+                return "tapped"
+
+            time.sleep(0.12)
+            focus_state = self._focus_state()
+            if focus_state == "ad":
+                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad opened after Watch Now tap {index + 1}/{tap_count}")
+                return "ad"
+            if focus_state in ("google_play", "browser"):
+                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Redirect opened after Watch Now tap {index + 1}/{tap_count}")
+                return focus_state
+            if focus_state != "ours":
+                return focus_state
+
+            frame = self._get_frame()
+            if frame is None:
+                return "unknown"
+            if self._dismiss_in_app_redirect_overlay(frame):
+                return "ad"
+            if self._find_button(frame, ["watch_now"], threshold=0.65):
+                continue
+            if self._find_daily_limit_button(frame):
+                return "daily_limit"
+            return "ad_page_changed"
+
+        return "tapped"
+
     def _tap_watch_now(self, tap_count: int = 1) -> bool | str:
         """Tap Watch Now only when its app-specific template is confidently visible."""
         import cv2
@@ -910,9 +993,11 @@ class BaseApp:
         result = self._find_button(frame, ["watch_now"], threshold=0.65)
         if result:
             _, cx, cy = result
-            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Watch Now template found at ({cx},{cy}), tapping x{tap_count}")
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Watch Now template found at ({cx},{cy}), guarded tapping up to x{tap_count}")
             if tap_count > 1:
-                self.adb.tap_many(cx, cy, count=tap_count, delay=0)
+                tap_status = self._guarded_watch_now_taps(cx, cy, tap_count)
+                if tap_status in ("ad", "google_play", "browser", "daily_limit"):
+                    return tap_status
             else:
                 self.adb.tap(cx, cy)
             return True
@@ -947,9 +1032,11 @@ class BaseApp:
             _, x, y, cw, ch = best
             cx = x0 + x + cw // 2
             cy = y0 + y + ch // 2
-            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Watch Now color button found at ({cx},{cy}), tapping x{tap_count}")
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Watch Now color button found at ({cx},{cy}), guarded tapping up to x{tap_count}")
             if tap_count > 1:
-                self.adb.tap_many(cx, cy, count=tap_count, delay=0)
+                tap_status = self._guarded_watch_now_taps(cx, cy, tap_count)
+                if tap_status in ("ad", "google_play", "browser", "daily_limit"):
+                    return tap_status
             else:
                 self.adb.tap(cx, cy)
             return True
@@ -997,6 +1084,12 @@ class BaseApp:
             tap_result = self._tap_watch_now(tap_count=clicks_per_batch)
             if tap_result == "daily_limit":
                 return self.handle_daily_limit()
+            if tap_result == "ad":
+                self._record_ad_load_success()
+                return self._wait_for_ad_finish()
+            if tap_result in ("google_play", "browser"):
+                self._recover_from_redirect(tap_result)
+                return None
             if not tap_result:
                 time.sleep(0.2)
                 continue
@@ -1245,6 +1338,8 @@ class BaseApp:
                 frame = self._get_frame()
                 if frame is not None and self._is_in_app_ad_overlay(frame):
                     focus_state = "ad"
+                elif frame is not None and self._dismiss_in_app_redirect_overlay(frame):
+                    focus_state = "ad"
                 else:
                     # Back to our app — look for reward dialog
                     logger.info(f"[{self.adb.name}] {self.APP_NAME}: Focus returned after {elapsed:.0f}s")
@@ -1300,6 +1395,9 @@ class BaseApp:
             if self.buttons.available:
                 frame = self._get_frame()
                 if frame is not None:
+                    if self._dismiss_in_app_redirect_overlay(frame):
+                        continue
+
                     # First only click explicit known skip/close templates.
                     result = self._find_button(frame, ["x_button", "continue_btn"], threshold=0.8)
                     if result:
