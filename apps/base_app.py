@@ -40,6 +40,7 @@ class BaseApp:
         self.post_ad_loading_retries = 0
         self._in_post_ad_retry = False
         self._last_loading_seen_at = 0
+        self._last_reward_x = None
 
         app_cfg = APPS.get(self.APP_NAME.lower(), {})
         self.COIN_ICON = app_cfg.get("coin_icon_coords", (427, 82))
@@ -291,6 +292,7 @@ class BaseApp:
                 name, cx, cy = result
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: Verified '{name}' at ({cx},{cy})")
                 if name == "x_button":
+                    self._last_reward_x = (cx, cy)
                     return AppState.REWARD_GRANTED
                 if name == "continue_btn":
                     return AppState.AD_PLAYING
@@ -553,7 +555,7 @@ class BaseApp:
                 continue
 
             if state == AppState.REWARD_GRANTED:
-                self.adb.tap(*self.REWARD_X)
+                self._tap_reward_granted_close()
                 time.sleep(1.5)
                 continue
 
@@ -1076,6 +1078,28 @@ class BaseApp:
                 return True
 
         return False
+
+    def _tap_reward_granted_close(self) -> bool:
+        """Close reward-granted screens using the detected X position when possible."""
+        frame = self._get_frame()
+        if frame is not None:
+            result = self._find_button(frame, ["x_button"], threshold=0.74)
+            if result:
+                _, cx, cy = result
+                self._last_reward_x = (cx, cy)
+                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Tapping detected reward X at ({cx},{cy})")
+                self.adb.tap(cx, cy)
+                return True
+
+        if self._last_reward_x:
+            cx, cy = self._last_reward_x
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Tapping last detected reward X at ({cx},{cy})")
+            self.adb.tap(cx, cy)
+            return True
+
+        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Tapping configured reward X fallback {self.REWARD_X}")
+        self.adb.tap(*self.REWARD_X)
+        return True
 
     def _tap_reward_ok(self, timeout: float = 8.0) -> bool:
         """Find and tap the reward OK button — template first, then pixel fallback."""

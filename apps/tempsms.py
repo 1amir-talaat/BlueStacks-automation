@@ -52,7 +52,7 @@ class TempSMSApp(BaseApp):
             logger.info(f"[{self.adb.name}] TempSMS: Ad #{self.ads_watched} collected!")
             return True
         if state == AppState.REWARD_GRANTED:
-            self.adb.tap(*self.REWARD_X)
+            self._tap_reward_granted_close()
             time.sleep(2)
             self.clear_stuck_dialogs()
             return True
