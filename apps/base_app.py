@@ -41,6 +41,7 @@ class BaseApp:
         self._in_post_ad_retry = False
         self._last_loading_seen_at = 0
         self._last_reward_x = None
+        self.stop_event = None
 
         app_cfg = APPS.get(self.APP_NAME.lower(), {})
         self.COIN_ICON = app_cfg.get("coin_icon_coords", (427, 82))
@@ -55,19 +56,22 @@ class BaseApp:
 
     def close_all_bg_apps(self):
         logger.info(f"[{self.adb.name}] Closing all background apps")
-        self.adb.press_key("HOME")
+        if not self.adb.press_key("HOME"):
+            logger.warning(f"[{self.adb.name}] HOME key timed out; continuing cleanup best-effort")
         time.sleep(0.5)
-        self.adb.shell("am force-stop com.virtualnumber.sms")
-        self.adb.shell("am force-stop com.secondphone.tempsms")
-        self.adb.shell("am force-stop com.android.vending")
+        for package in ("com.virtualnumber.sms", "com.secondphone.tempsms", "com.android.vending"):
+            self.adb.close_app(package)
         time.sleep(0.5)
-        self.adb.shell("input keyevent KEYCODE_HOME")
+        self.adb.press_key("KEYCODE_HOME")
         time.sleep(0.5)
 
     def launch(self) -> bool:
         self.close_all_bg_apps()
         time.sleep(0.5)
         self.adb.launch_app(self.PACKAGE_NAME, self.ACTIVITY_NAME)
+        if self.adb.last_error:
+            logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Launch command may have failed: {self.adb.last_error}")
+            return False
         # Wait up to 15s for the app to appear in the foreground
         for _ in range(30):
             time.sleep(0.5)
@@ -674,6 +678,10 @@ class BaseApp:
         self.launch()
 
         while True:
+            if self.stop_event and self.stop_event.is_set():
+                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Stop requested")
+                return "stopped"
+
             self.clear_stuck_dialogs()
             state = self.detect_state()
             logger.info(f"[{self.adb.name}] {self.APP_NAME}: State: {state.value}")

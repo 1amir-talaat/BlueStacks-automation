@@ -20,25 +20,53 @@ class InstanceTracker:
         self.app_key = app_key
         self.app = None
         self.running = False
+        self.last_result = "idle"
+        self.last_error = ""
+        self.thread = None
+        self.stop_event = threading.Event()
         self.results = {"watched": 0, "failed": 0}
         self.disabled_apps: set[str] = set()
+        self.lock = threading.Lock()
 
         if app_key and app_key in APP_CLASSES:
             self.app = APP_CLASSES[app_key](adb)
+            self.app.stop_event = self.stop_event
 
     def assign_app(self, app_key: str):
-        self.app_key = app_key
-        self.app = APP_CLASSES[app_key](self.adb)
+        with self.lock:
+            self.app_key = app_key
+            self.app = APP_CLASSES[app_key](self.adb)
+            self.app.stop_event = self.stop_event
+            self.last_result = "assigned"
+
+    def request_stop(self):
+        self.stop_event.set()
+        self.last_result = "stopping"
+
+    def prepare_start(self):
+        self.stop_event.clear()
+        if self.app:
+            self.app.stop_event = self.stop_event
+        self.last_error = ""
+        self.last_result = "starting"
 
     def status(self) -> dict:
+        with self.lock:
+            app_key = self.app_key
+            app = self.app
+            running = self.running
+            last_result = self.last_result
+            last_error = self.last_error
+            adb_error = self.adb.last_error
         return {
             "name": self.adb.name,
             "device_id": self.adb.device_id,
             "online": self.adb.is_online(),
-            "app": self.app_key,
-            "ads_watched": self.app.ads_watched if self.app else 0,
-            "state": "idle",
-            "running": self.running,
+            "app": app_key,
+            "ads_watched": app.ads_watched if app else 0,
+            "state": last_error or adb_error or last_result,
+            "running": running,
+            "adb_timeouts": self.adb.timeout_count,
         }
 
 

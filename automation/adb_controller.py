@@ -18,6 +18,8 @@ class ADBController:
         self.name = name
         self.device_id = device_id
         self.connected = False
+        self.last_error = ""
+        self.timeout_count = 0
         self._adb = self._resolve_adb()
 
     @staticmethod
@@ -32,13 +34,37 @@ class ADBController:
     def _run(self, args: list[str], timeout: int = 10) -> subprocess.CompletedProcess:
         cmd = [self._adb] + args
         logger.debug(f"[{self.name}] Running: {' '.join(cmd)}")
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            self.last_error = ""
+            return result
+        except subprocess.TimeoutExpired:
+            self.timeout_count += 1
+            self.connected = False
+            self.last_error = f"ADB timeout after {timeout}s: {' '.join(args)}"
+            logger.error(f"[{self.name}] {self.last_error}")
+            return subprocess.CompletedProcess(cmd, returncode=124, stdout="", stderr=self.last_error)
+        except OSError as e:
+            self.connected = False
+            self.last_error = str(e)
+            logger.error(f"[{self.name}] ADB command failed: {e}")
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=str(e))
+
+    def _recover_after_timeout(self) -> bool:
+        logger.info(f"[{self.name}] Rechecking ADB after timeout")
+        result = self._run(["-s", self.device_id, "get-state"], timeout=3)
+        if "device" in result.stdout.strip():
+            self.connected = True
+            logger.info(f"[{self.name}] ADB recovered")
+            return True
+        return False
 
     def connect(self) -> bool:
         result = self._run(["-s", self.device_id, "get-state"], timeout=5)
         output = result.stdout.strip()
         if "device" in output:
             self.connected = True
+            self.last_error = ""
             logger.info(f"[{self.name}] Connected ({self.device_id})")
             return True
         logger.error(f"[{self.name}] Not online: {output}")
@@ -50,14 +76,20 @@ class ADBController:
 
     def is_online(self) -> bool:
         result = self._run(["-s", self.device_id, "get-state"], timeout=5)
+        if "device" in result.stdout.strip():
+            return True
+        if result.returncode != 0:
+            self.last_error = result.stderr.strip() or self.last_error
         return "device" in result.stdout.strip()
 
-    def shell(self, command: str) -> str:
-        result = self._run(["-s", self.device_id, "shell", command])
+    def shell(self, command: str, timeout: int = 10) -> str:
+        result = self._run(["-s", self.device_id, "shell", command], timeout=timeout)
+        if result.returncode == 124:
+            self._recover_after_timeout()
         return result.stdout.strip()
 
     def tap(self, x: int, y: int):
-        self.shell(f"input tap {x} {y}")
+        self.shell(f"input tap {x} {y}", timeout=4)
         logger.debug(f"[{self.name}] Tap ({x}, {y})")
 
     def tap_many(self, x: int, y: int, count: int = 5, delay: float = 0.05):
@@ -66,26 +98,30 @@ class ADBController:
         if delay > 0:
             delay_cmd = f"; sleep {delay}"
         command = "; ".join([f"input tap {x} {y}{delay_cmd}" for _ in range(count)])
-        self.shell(command)
+        self.shell(command, timeout=6)
         logger.debug(f"[{self.name}] Tap many ({x}, {y}) x{count}")
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration: int = 300):
-        self.shell(f"input swipe {x1} {y1} {x2} {y2} {duration}")
+        self.shell(f"input swipe {x1} {y1} {x2} {y2} {duration}", timeout=5)
 
     def press_key(self, key: str) -> bool:
-        result = self.shell(f"input keyevent {key}")
-        return True
+        result = self.shell(f"input keyevent {key}", timeout=4)
+        return not self.last_error
 
     def launch_app(self, package: str, activity: str = ""):
         if activity:
-            self.shell(f"am start -n {package}/{activity}")
+            self.shell(f"am start -n {package}/{activity}", timeout=8)
         else:
-            self.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
+            self.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1", timeout=8)
         logger.info(f"[{self.name}] Launched {package}")
 
-    def close_app(self, package: str):
-        self.shell(f"am force-stop {package}")
+    def close_app(self, package: str) -> bool:
+        self.shell(f"am force-stop {package}", timeout=5)
+        if self.last_error:
+            logger.warning(f"[{self.name}] Close app may have failed for {package}: {self.last_error}")
+            return False
         logger.info(f"[{self.name}] Closed {package}")
+        return True
 
     def screenshot(self, local_path: str = "current.png") -> bool:
         cmd = [self._adb, "-s", self.device_id, "exec-out", "screencap", "-p"]
