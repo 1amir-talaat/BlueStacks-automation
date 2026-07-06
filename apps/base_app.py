@@ -1012,9 +1012,9 @@ class BaseApp:
 
         # Daily-limit dialog can appear over the ad page right after Watch Now.
         # Do not click anything else while it is visible.
-        daily_limit = self._find_button(frame, ["daily_limit"], threshold=0.68)
+        daily_limit = self._find_daily_limit_button(frame)
         if daily_limit:
-            _, cx, cy = daily_limit
+            cx, cy = daily_limit
             logger.info(f"[{self.adb.name}] {self.APP_NAME}: Daily limit button found at ({cx},{cy}) while looking for Watch Now")
             return "daily_limit"
 
@@ -1077,7 +1077,7 @@ class BaseApp:
         clicks_per_batch = 5
 
         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Starting fast Watch Now spam ({clicks_per_batch} taps)")
-        for click_index in range(clicks_per_batch):
+        for attempt in range(2):
             focus_state = self._focus_state()
 
             if focus_state == "ad":
@@ -1108,6 +1108,10 @@ class BaseApp:
                         pass
                     time.sleep(1)
 
+            frame = self._get_frame()
+            if frame is not None and self._find_daily_limit_button(frame):
+                return self.handle_daily_limit()
+
             logger.info(f"[{self.adb.name}] {self.APP_NAME}: Finding Watch Now for fast tap burst")
             tap_result = self._tap_watch_now(tap_count=clicks_per_batch)
             if tap_result == "daily_limit":
@@ -1134,6 +1138,13 @@ class BaseApp:
             if focus_state in ("google_play", "browser"):
                 self._recover_from_redirect(focus_state)
                 return None
+
+            frame = self._get_frame()
+            if frame is not None and self._find_daily_limit_button(frame):
+                return self.handle_daily_limit()
+
+            if attempt == 0:
+                time.sleep(0.2)
 
         time.sleep(0.3)
         focus_state = self._focus_state()
