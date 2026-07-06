@@ -67,7 +67,7 @@ class ADBController:
             self.last_error = ""
             logger.info(f"[{self.name}] Connected ({self.device_id})")
             return True
-        logger.error(f"[{self.name}] Not online: {output}")
+        logger.warning(f"[{self.name}] Not online: {output}")
         return False
 
     def disconnect(self):

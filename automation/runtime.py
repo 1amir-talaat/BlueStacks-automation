@@ -94,7 +94,12 @@ def run_instance(tracker):
 
     try:
         while tracker.app and not tracker.stop_event.is_set():
+            running_app = tracker.app_key
+            ads_before = tracker.app.ads_watched if tracker.app else 0
             result = tracker.app.run_loop()
+            ads_after = tracker.app.ads_watched if tracker.app else ads_before
+            if running_app:
+                tracker.ads_by_app[running_app] = tracker.ads_by_app.get(running_app, 0) + max(0, ads_after - ads_before)
             tracker.last_result = result or "loop_complete"
             if result == "stopped" or tracker.stop_event.is_set():
                 break
@@ -112,6 +117,7 @@ def run_instance(tracker):
 
                 if new_app in tracker.disabled_apps:
                     logger.warning(f"[{name}] Both apps are blocked by fake-date loading; stopping this instance for today")
+                    tracker.last_result = "done_today"
                     break
 
                 cairo_time = get_cairo_time()
@@ -139,6 +145,7 @@ def run_instance(tracker):
 
 def default_app_assignments() -> dict[str, str]:
     return {
+        "default": "getsms",
         "instance_1": "getsms",
         "instance_2": "getsms",
         "instance_3": "getsms",

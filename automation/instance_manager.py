@@ -1,6 +1,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from automation.adb_controller import ADBController
+from automation.bluestacks_manager import BlueStacksManager
 from apps.getsms import GetSMSApp
 from apps.tempsms import TempSMSApp
 from config import APPS
@@ -25,6 +26,7 @@ class InstanceTracker:
         self.thread = None
         self.stop_event = threading.Event()
         self.results = {"watched": 0, "failed": 0}
+        self.ads_by_app: dict[str, int] = {}
         self.disabled_apps: set[str] = set()
         self.lock = threading.Lock()
 
@@ -58,6 +60,7 @@ class InstanceTracker:
             last_result = self.last_result
             last_error = self.last_error
             adb_error = self.adb.last_error
+            ads_by_app = dict(self.ads_by_app)
         return {
             "name": self.adb.name,
             "device_id": self.adb.device_id,
@@ -67,6 +70,7 @@ class InstanceTracker:
             "state": last_error or adb_error or last_result,
             "running": running,
             "adb_timeouts": self.adb.timeout_count,
+            "ads_by_app": ads_by_app,
         }
 
 
@@ -76,16 +80,34 @@ class InstanceManager:
 
     @classmethod
     def auto_discover(cls, app_assignments: dict[str, str] | None = None) -> "InstanceManager":
-        devices = ADBController.discover_devices()
         manager = cls()
 
-        for i, device_id in enumerate(devices, 1):
-            name = f"instance_{i}"
+        bs_instances = [inst for inst in BlueStacksManager().list_instances() if inst.device_id]
+        seen_devices = set()
+
+        for i, bs_inst in enumerate(bs_instances, 1):
+            device_id = bs_inst.device_id
+            seen_devices.add(device_id)
+            name = bs_inst.display_name
             adb = ADBController(name=name, device_id=device_id)
             app_key = app_assignments.get(name) if app_assignments else None
+            if app_key is None and app_assignments:
+                app_key = app_assignments.get(f"instance_{i}")
+            if app_key is None and app_assignments:
+                app_key = app_assignments.get("default")
             manager.trackers[name] = InstanceTracker(adb, app_key)
 
-        logger.info(f"Discovered {len(devices)} instance(s)")
+        # Include any connected ADB device that is not present in BlueStacks config.
+        devices = ADBController.discover_devices()
+        for device_id in devices:
+            if device_id in seen_devices:
+                continue
+            name = f"adb_{len(manager.trackers) + 1}"
+            adb = ADBController(name=name, device_id=device_id)
+            app_key = app_assignments.get("default") if app_assignments else None
+            manager.trackers[name] = InstanceTracker(adb, app_key)
+
+        logger.info(f"Discovered {len(manager.trackers)} configured/connected instance(s)")
         return manager
 
     def connect_all(self) -> dict[str, bool]:

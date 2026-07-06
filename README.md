@@ -44,6 +44,10 @@ python main.py
 
 - `d` discover and reconnect BlueStacks instances
 - `c` connect all discovered instances
+- `j` / `k` select an installed BlueStacks instance
+- `m` start the selected BlueStacks instance
+- `h` start all detected BlueStacks instances
+- `z` open BlueStacks Multi-instance Manager
 - `a` start automation on all instances
 - `s` start the selected instance
 - `x` stop the selected instance
@@ -52,7 +56,8 @@ python main.py
 - `l` close the selected app
 - `e` export selected instance logs to `logs/`
 - `f` export all logs to `logs/`
-- `y` export selected logs and copy them to the Windows clipboard
+- `u` copy currently visible log rows
+- `y` copy the full current log view to the Windows clipboard
 - `v` show selected-instance logs
 - `b` show logs from all instances
 - `w` show warnings/errors only

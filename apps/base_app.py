@@ -42,6 +42,9 @@ class BaseApp:
         self._last_loading_seen_at = 0
         self._last_reward_x = None
         self.stop_event = None
+        self._daily_limit_grace_until = 0
+        self._post_ad_grace_until = 0
+        self._started_at = 0
 
         app_cfg = APPS.get(self.APP_NAME.lower(), {})
         self.COIN_ICON = app_cfg.get("coin_icon_coords", (427, 82))
@@ -642,6 +645,8 @@ class BaseApp:
             logger.error(f"[{self.adb.name}] {self.APP_NAME}: Date trick aborted; could not set fake date")
             return
 
+        self._daily_limit_grace_until = time.time() + 45
+
         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Waiting 3s after fake-date change before retrying")
         time.sleep(3)
 
@@ -677,6 +682,7 @@ class BaseApp:
 
     def run_loop(self):
         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Starting loop (no limit)")
+        self._started_at = time.time()
 
         # Always start from a clean app session.
         self.launch()
@@ -705,10 +711,28 @@ class BaseApp:
                 continue
 
             if state == AppState.LOADING_DIALOG:
+                if time.time() < self._post_ad_grace_until:
+                    logger.info(
+                        f"[{self.adb.name}] {self.APP_NAME}: Loading during post-ad grace; "
+                        "waiting for reward/ad page to settle"
+                    )
+                    time.sleep(3)
+                    continue
+
+                if time.time() < self._daily_limit_grace_until:
+                    logger.info(
+                        f"[{self.adb.name}] {self.APP_NAME}: Loading after daily-limit date change; "
+                        "waiting instead of switching app"
+                    )
+                    time.sleep(3)
+                    self.go_to_ad_page()
+                    continue
+
                 self.post_ad_loading_retries += 1
                 if self.post_ad_loading_retries >= 2:
+                    reason = "startup blocked loading" if time.time() - self._started_at < 90 else "repeated loading"
                     logger.warning(
-                        f"[{self.adb.name}] {self.APP_NAME}: Loading dialog detected twice; "
+                        f"[{self.adb.name}] {self.APP_NAME}: Loading dialog detected twice ({reason}); "
                         "switching app"
                     )
                     self.post_ad_loading_retries = 0
@@ -982,6 +1006,10 @@ class BaseApp:
         if frame is None:
             return False
 
+        if self._is_blocking_loading_dialog(frame):
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Watch Now blocked by loading dialog")
+            return "loading_dialog"
+
         # Daily-limit dialog can appear over the ad page right after Watch Now.
         # Do not click anything else while it is visible.
         daily_limit = self._find_button(frame, ["daily_limit"], threshold=0.68)
@@ -1084,6 +1112,8 @@ class BaseApp:
             tap_result = self._tap_watch_now(tap_count=clicks_per_batch)
             if tap_result == "daily_limit":
                 return self.handle_daily_limit()
+            if tap_result == "loading_dialog":
+                return None
             if tap_result == "ad":
                 self._record_ad_load_success()
                 return self._wait_for_ad_finish()
@@ -1350,6 +1380,7 @@ class BaseApp:
                         self.ads_watched += 1
                         self._record_ad_load_success()
                         self.post_ad_loading_retries = 0
+                        self._post_ad_grace_until = 0
                         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad #{self.ads_watched} collected!")
                         return
 
@@ -1379,6 +1410,8 @@ class BaseApp:
 
                     if state == AppState.AD_PAGE:
                         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad finished, back on ad page")
+                        self.post_ad_loading_retries = 0
+                        self._post_ad_grace_until = time.time() + 20
                         return
 
                     # Fallback: we just came back from ad, assume reward — tap OK position
@@ -1388,6 +1421,7 @@ class BaseApp:
                     self.ads_watched += 1
                     self._record_ad_load_success()
                     self.post_ad_loading_retries = 0
+                    self._post_ad_grace_until = 0
                     logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad #{self.ads_watched} collected!")
                     return
 

@@ -10,7 +10,7 @@ class UILogStore(logging.Handler):
         self.records = deque(maxlen=max_lines)
         self.by_instance = {}
         self._lock = threading.Lock()
-        self._instance_pattern = re.compile(r"\[(instance_\d+)\]")
+        self._instance_pattern = re.compile(r"\[([^\]]+)\]")
 
     def emit(self, record: logging.LogRecord) -> None:
         message = self.format(record)
