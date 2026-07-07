@@ -465,18 +465,33 @@ class BaseApp:
                 return True
 
         # --- TempSMS theme: dark dialog + red/pink spinner + white "Loading..." text ---
-        # Look for white text in center (the "Loading..." label)
-        white_text = cv2.inRange(gray, 200, 255)
-        white_ratio = cv2.countNonZero(white_text) / max(1, white_text.size)
-        has_white_text = 0.01 < white_ratio < 0.15
+        temp_roi = frame[int(h * 0.40):int(h * 0.67), int(w * 0.25):int(w * 0.85)]
+        if temp_roi.size == 0:
+            return False
+        temp_hsv = cv2.cvtColor(temp_roi, cv2.COLOR_BGR2HSV)
+        temp_gray = cv2.cvtColor(temp_roi, cv2.COLOR_BGR2GRAY)
 
-        if has_white_text:
-            # Look for a small red/pink arc (the spinner)
-            red1 = cv2.inRange(hsv, np.array([0, 20, 35]), np.array([18, 255, 255]))
-            red2 = cv2.inRange(hsv, np.array([140, 20, 35]), np.array([180, 255, 255]))
-            red_count = cv2.countNonZero(red1 | red2)
-            if red_count > 10:
-                return True
+        # The purchase page is dimmed while the popup is open, so the text often
+        # captures as gray rather than pure white.
+        white_text = cv2.inRange(temp_gray, 165, 255)
+        white_ratio = cv2.countNonZero(white_text) / max(1, white_text.size)
+        has_loading_text = 0.004 < white_ratio < 0.15
+
+        # The TempSMS popup itself is a centered dark rounded rectangle. Checking
+        # this keeps the looser text/spinner thresholds from matching normal UI.
+        popup = frame[int(h * 0.46):int(h * 0.59), int(w * 0.32):int(w * 0.70)]
+        has_dark_popup = False
+        if popup.size:
+            popup_gray = cv2.cvtColor(popup, cv2.COLOR_BGR2GRAY)
+            dark_ratio = cv2.countNonZero(cv2.inRange(popup_gray, 0, 45)) / max(1, popup_gray.size)
+            has_dark_popup = dark_ratio > 0.45
+
+        # Look for a small red/pink arc (the spinner).
+        red1 = cv2.inRange(temp_hsv, np.array([0, 20, 35]), np.array([18, 255, 255]))
+        red2 = cv2.inRange(temp_hsv, np.array([140, 20, 35]), np.array([180, 255, 255]))
+        red_count = cv2.countNonZero(red1 | red2)
+        if red_count > 10 and (has_loading_text or has_dark_popup):
+            return True
 
         return False
 

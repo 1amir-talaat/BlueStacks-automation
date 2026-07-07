@@ -82,12 +82,14 @@ class InstanceManager:
     def auto_discover(cls, app_assignments: dict[str, str] | None = None) -> "InstanceManager":
         manager = cls()
 
-        bs_instances = [inst for inst in BlueStacksManager().list_instances() if inst.device_id]
+        bs_manager = BlueStacksManager()
+        bs_instances = [inst for inst in bs_manager.list_instances() if inst.device_id]
         seen_devices = set()
 
         for i, bs_inst in enumerate(bs_instances, 1):
+            bs_inst = bs_manager.resolve_online_instance(bs_inst) or bs_inst
             device_id = bs_inst.device_id
-            seen_devices.add(device_id)
+            seen_devices.update(bs_inst.device_ids)
             name = bs_inst.display_name
             adb = ADBController(name=name, device_id=device_id)
             app_key = app_assignments.get(name) if app_assignments else None

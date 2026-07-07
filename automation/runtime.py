@@ -213,6 +213,10 @@ def start_tracker(tracker) -> bool:
     if tracker.running:
         logger.info(f"[{tracker.adb.name}] Already running")
         return False
+    if not tracker.adb.is_online():
+        logger.warning(f"[{tracker.adb.name}] Cannot start automation while device is offline")
+        tracker.last_result = "offline"
+        return False
     if not tracker.app:
         logger.warning(f"[{tracker.adb.name}] Select an app before starting")
         return False
