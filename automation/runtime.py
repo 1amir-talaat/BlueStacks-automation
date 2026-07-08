@@ -109,32 +109,60 @@ def run_instance(tracker):
             if result == "stopped" or tracker.stop_event.is_set():
                 tracker.last_result = "stopped"
                 break
-            if result not in ("switch_app", "date_trick_blocked"):
+            if result not in ("switch_app", "date_trick_blocked", "rate_limited"):
                 break
 
             old_app = tracker.app_key
             new_app = "tempsms" if old_app == "getsms" else "getsms"
 
-            if result == "date_trick_blocked":
+            if result in ("date_trick_blocked", "rate_limited"):
                 tracker.disabled_apps.add(old_app)
                 if tracker.app:
                     logger.info(f"[{name}] Closing blocked app {old_app}")
                     tracker.adb.close_app(tracker.app.PACKAGE_NAME)
 
                 if new_app in tracker.disabled_apps:
-                    logger.warning(f"[{name}] Both apps are blocked by fake-date loading; stopping this instance for today")
+                    why = (
+                        "rate-limited (no coins / loader)"
+                        if result == "rate_limited"
+                        else "blocked by fake-date loading"
+                    )
+                    logger.warning(
+                        f"[{name}] Both apps exhausted ({why} on {old_app}; "
+                        f"{new_app} already disabled) — stopping this instance for today"
+                    )
                     tracker.last_result = "done_today"
                     break
 
-                cairo_time = get_cairo_time()
-                logger.info(f"[{name}] Restoring device time to Cairo time before switching app ({cairo_time['source']})")
-                tracker.adb.restore_time(
-                    cairo_time["epoch_seconds"],
-                    cairo_time["timezone"],
-                    cairo_time["date"],
-                )
+                # rate_limited: date changes will not help — skip fake-date restore.
+                # date_trick_blocked: restore real Cairo time before trying the other app.
+                if result == "date_trick_blocked":
+                    cairo_time = get_cairo_time()
+                    logger.info(
+                        f"[{name}] Restoring device time to Cairo time before switching app "
+                        f"({cairo_time['source']})"
+                    )
+                    tracker.adb.restore_time(
+                        cairo_time["epoch_seconds"],
+                        cairo_time["timezone"],
+                        cairo_time["date"],
+                    )
 
-            reason = "fake-date loading dialog" if result == "date_trick_blocked" else "repeated ad-load failures"
+            if result == "rate_limited":
+                reason = "daily rate limit (loader after ad, no coins x2)"
+            elif result == "date_trick_blocked":
+                reason = "fake-date loading dialog"
+            else:
+                reason = "repeated ad-load failures"
+
+            # If the only remaining app is already disabled, stop the instance.
+            if new_app in tracker.disabled_apps:
+                logger.warning(
+                    f"[{name}] Cannot switch to {new_app} (already disabled); stopping instance"
+                )
+                tracker.last_result = "done_today"
+                break
+
             logger.warning(f"[{name}] Switching from {old_app} to {new_app} after {reason}")
             tracker.assign_app(new_app)
             time.sleep(2)

@@ -175,13 +175,28 @@ class ADBController:
             return int(match.group(1)), int(match.group(2))
         return 1080, 1920
 
+    def dump_ui_xml(self) -> str:
+        """Dump the current UI hierarchy via UIAutomator (best-effort)."""
+        return self.shell(
+            "uiautomator dump /sdcard/window.xml >/dev/null && cat /sdcard/window.xml",
+            timeout=8,
+        )
+
+    def has_ui_text(self, texts: list[str]) -> bool:
+        """Return True if any UIAutomator node text/desc contains one of the values."""
+        xml = self.dump_ui_xml()
+        if not xml:
+            return False
+        lowered = xml.lower()
+        return any(text.lower() in lowered for text in texts)
+
     def tap_ui_text(self, texts: list[str], timeout: float = 5.0) -> bool:
         """Tap the first visible UIAutomator node whose text contains any value."""
         deadline = time.time() + timeout
         wanted = [text.lower() for text in texts]
 
         while time.time() < deadline:
-            xml = self.shell("uiautomator dump /sdcard/window.xml >/dev/null && cat /sdcard/window.xml")
+            xml = self.dump_ui_xml()
             if not xml:
                 time.sleep(0.5)
                 continue
