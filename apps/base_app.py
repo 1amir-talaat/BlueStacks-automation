@@ -804,7 +804,7 @@ class BaseApp:
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: Continuing ads after date trick (attempt {ads_this_cycle + 1}/{max_ads_per_cycle})")
                 ads_before = self.ads_watched
                 result = self._aggressive_watch_now()
-                if result in ("switch_app", "date_trick_blocked", "stopped"):
+                if result in ("switch_app", "date_trick_blocked", "rate_limited", "stopped"):
                     return result
                 if self.ads_watched > ads_before:
                     ads_this_cycle += self.ads_watched - ads_before
@@ -884,9 +884,9 @@ class BaseApp:
                     self.go_to_ad_page()
                     continue
 
-                # TempSMS: after an ad attempt, stuck loader ⇒ no-reward path
-                # (2 finished ads with loader/no coins = daily rate limit; do not date-trick).
-                if self.APP_NAME == "tempsms" and (
+                # After an ad attempt, stuck loader ⇒ no-reward path for GetSMS/TempSMS
+                # (2x loader/no coins = daily rate limit; date change will not help).
+                if self._is_coin_farm_app() and (
                     self.ads_watched > 0 or self.post_ad_no_reward_streak > 0 or self.watch_now_clicks > 0
                 ):
                     result = self._handle_post_ad_no_reward("loading dialog in main loop")
@@ -902,10 +902,13 @@ class BaseApp:
                     reason = "startup blocked loading" if time.time() - self._started_at < 90 else "repeated loading"
                     logger.warning(
                         f"[{self.adb.name}] {self.APP_NAME}: Loading dialog detected twice ({reason}); "
-                        "switching app"
+                        "treating as rate limit / blocked"
                     )
                     self.post_ad_loading_retries = 0
                     self._in_post_ad_retry = False
+                    # Startup-only loading with no ad attempts: still exit this app.
+                    if self._is_coin_farm_app():
+                        return "rate_limited"
                     return "date_trick_blocked"
 
                 logger.info(
@@ -973,12 +976,31 @@ class BaseApp:
         self.post_ad_loading_retries = 0
         self._no_reward_counted_for_current_ad = False
 
+    def _is_coin_farm_app(self) -> bool:
+        return self.APP_NAME in ("getsms", "tempsms")
+
+    def _is_post_ad_loading_ui(self, frame) -> bool:
+        """True when a loading popup/spinner is shown on the purchase/ad page."""
+        if frame is None:
+            return False
+        if self._is_blocking_loading_dialog(frame) or self._is_loading_dialog(frame):
+            return True
+        if self.APP_NAME == "tempsms" and self._is_tempsms_inline_loading(frame):
+            return True
+        # GetSMS often exposes the literal Loading label via UIAutomator.
+        if self.APP_NAME == "getsms":
+            try:
+                if self.adb.has_ui_text(["Loading", "Loading..."]):
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _handle_post_ad_no_reward(self, reason: str) -> str | None:
         """Handle post-ad loader / no-coin outcome.
 
-        Counts at most once per finished ad. TempSMS: 2 consecutive no-reward
-        outcomes => daily rate limit (exit app; do not date-trick). Other apps
-        keep the previous loading → date_trick_blocked path.
+        Counts at most once per finished ad. GetSMS/TempSMS: 2 consecutive
+        no-reward outcomes => daily rate limit (exit app; do not date-trick).
         """
         if self._no_reward_counted_for_current_ad:
             return None
@@ -1011,17 +1033,11 @@ class BaseApp:
         self.post_ad_loading_retries = 0
         self._in_post_ad_retry = False
 
-        if self.APP_NAME == "tempsms":
-            logger.warning(
-                f"[{self.adb.name}] TempSMS: Rate limit reached for today "
-                f"(loader after ad with no coins x2); date change will not help — exiting TempSMS"
-            )
-            return "rate_limited"
-
         logger.warning(
-            f"[{self.adb.name}] {self.APP_NAME}: Loading/no-reward after ad twice; switching app"
+            f"[{self.adb.name}] {self.APP_NAME}: Rate limit reached for today "
+            f"(loader after ad with no coins x2); date change will not help — exiting app"
         )
-        return "date_trick_blocked"
+        return "rate_limited"
 
     def _record_ad_load_failure(self) -> str | None:
         self.failed_ad_load_batches += 1
@@ -1354,8 +1370,8 @@ class BaseApp:
             if tap_result == "daily_limit":
                 return self.handle_daily_limit()
             if tap_result == "loading_dialog":
-                # Watch Now while inline/blocking loader is up — count as no-earn for TempSMS.
-                if self.APP_NAME == "tempsms":
+                # Watch Now while loader is up — count as no-earn for coin farm apps.
+                if self._is_coin_farm_app():
                     result = self._handle_post_ad_no_reward("Watch Now blocked by Loading...")
                     if result:
                         return result
@@ -1662,9 +1678,9 @@ class BaseApp:
                     if state == AppState.DAILY_LIMIT:
                         return self.handle_daily_limit()
 
-                    # TempSMS inline Loading... spinner (often still AD_PAGE for Watch Now).
-                    if self.APP_NAME == "tempsms" and frame is not None and self._is_tempsms_inline_loading(frame):
-                        return self._handle_post_ad_no_reward("inline Loading... after ad (no coins)")
+                    # Inline / popup Loading... (Watch Now may still be visible).
+                    if self._is_post_ad_loading_ui(frame):
+                        return self._handle_post_ad_no_reward("loading UI after ad (no coins)")
 
                     if state == AppState.LOADING_DIALOG:
                         return self._handle_post_ad_no_reward("loading dialog after ad")
@@ -1672,41 +1688,33 @@ class BaseApp:
                     if state == AppState.AD_PAGE:
                         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad finished, back on ad page")
                         self._post_ad_grace_until = time.time() + 20
-                        if self.APP_NAME == "tempsms":
-                            # Re-check spinner after a short settle — it often appears slightly late.
+                        if self._is_coin_farm_app():
+                            # Re-check loader after a short settle — it often appears slightly late.
                             if self._interruptible_sleep(1.5):
                                 return "stopped"
                             settle_frame = self._get_frame()
-                            if settle_frame is not None and (
-                                self._is_tempsms_inline_loading(settle_frame)
-                                or self._is_blocking_loading_dialog(settle_frame)
-                            ):
+                            if self._is_post_ad_loading_ui(settle_frame):
                                 return self._handle_post_ad_no_reward(
-                                    "Loading... after ad settle (no coins)"
+                                    "Loading after ad settle (no coins)"
                                 )
-                            # Full ad finished with no reward UI and no balance gain ⇒ no earn.
+                            # Full ad finished with no reward UI ⇒ no earn (both apps).
                             return self._handle_post_ad_no_reward("ad finished without reward/coins")
                         return
 
-                    if frame is not None and (
-                        self._is_loading_dialog(frame)
-                        or (self.APP_NAME == "tempsms" and self._is_tempsms_inline_loading(frame))
-                    ):
+                    if self._is_post_ad_loading_ui(frame):
                         logger.info(
                             f"[{self.adb.name}] {self.APP_NAME}: Loading popup visible after ad; "
                             "counting as no-reward instead of OK fallback"
                         )
-                        if self.APP_NAME == "tempsms":
-                            return self._handle_post_ad_no_reward("loading popup before OK fallback")
-                        return
+                        return self._handle_post_ad_no_reward("loading popup before OK fallback")
 
-                    # Fallback: try OK once; for TempSMS only count real rewards.
+                    # Fallback: try OK once; only count real rewards for coin farm apps.
                     logger.info(f"[{self.adb.name}] {self.APP_NAME}: Tapping OK position (fallback)")
                     self.adb.tap(*self.OK_BTN)
                     if self._interruptible_sleep(2):
                         return "stopped"
 
-                    if self.APP_NAME == "tempsms":
+                    if self._is_coin_farm_app():
                         post_frame = self._get_frame()
                         post_state = self.detect_state()
                         if post_state in (AppState.REWARD_RECEIVED, AppState.REWARD_GRANTED):
@@ -1714,9 +1722,7 @@ class BaseApp:
                             if self.ads_watched > ads_before:
                                 self._record_ad_load_success()
                             return
-                        if post_state == AppState.LOADING_DIALOG or (
-                            post_frame is not None and self._is_tempsms_inline_loading(post_frame)
-                        ):
+                        if post_state == AppState.LOADING_DIALOG or self._is_post_ad_loading_ui(post_frame):
                             return self._handle_post_ad_no_reward("loader after OK fallback")
                         # No coins confirmed — do not fake-increment ads_watched.
                         return self._handle_post_ad_no_reward("no coins after ad (OK fallback)")
