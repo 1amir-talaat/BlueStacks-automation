@@ -124,6 +124,95 @@ class InstanceManager:
             for future in as_completed(futures):
                 future.result()
 
+    def has_running(self) -> bool:
+        return any(t.running for t in self.trackers.values())
+
+    def find_by_device(self, device_id: str) -> InstanceTracker | None:
+        for tracker in self.trackers.values():
+            if tracker.adb.device_id == device_id:
+                return tracker
+        return None
+
+    def find_by_name(self, name: str) -> InstanceTracker | None:
+        return self.trackers.get(name)
+
+    def ensure_tracker(
+        self,
+        name: str,
+        device_id: str,
+        app_key: str | None = None,
+        app_assignments: dict[str, str] | None = None,
+    ) -> InstanceTracker:
+        """Return an existing tracker for this device/name, or create one.
+
+        Never replaces a tracker that is still running.
+        """
+        existing = self.find_by_device(device_id) or self.find_by_name(name)
+        if existing:
+            if existing.adb.device_id != device_id:
+                if existing.running:
+                    logger.warning(
+                        f"Keeping running tracker {existing.adb.name} on {existing.adb.device_id}; "
+                        f"not rebinding to {device_id}"
+                    )
+                else:
+                    existing.adb.device_id = device_id
+            if name != existing.adb.name and name not in self.trackers and not existing.running:
+                # Re-key under the preferred BlueStacks display name when idle.
+                self.trackers.pop(existing.adb.name, None)
+                existing.adb.name = name
+                self.trackers[name] = existing
+            return existing
+
+        resolved_app = app_key
+        if resolved_app is None and app_assignments:
+            resolved_app = app_assignments.get(name) or app_assignments.get("default")
+        adb = ADBController(name=name, device_id=device_id)
+        tracker = InstanceTracker(adb, resolved_app)
+        self.trackers[name] = tracker
+        logger.info(f"Added tracker for {name} ({device_id})")
+        return tracker
+
+    def sync_from_bluestacks(self, app_assignments: dict[str, str] | None = None) -> int:
+        """Merge BlueStacks/ADB devices into this manager without dropping live trackers.
+
+        Returns the number of newly added trackers.
+        """
+        added = 0
+        bs_instances = [inst for inst in BlueStacksManager().list_instances() if inst.device_id]
+        seen_devices: set[str] = set()
+
+        for i, bs_inst in enumerate(bs_instances, 1):
+            device_id = bs_inst.device_id
+            seen_devices.add(device_id)
+            name = bs_inst.display_name
+            before = len(self.trackers)
+            app_key = None
+            if app_assignments:
+                app_key = app_assignments.get(name)
+                if app_key is None:
+                    app_key = app_assignments.get(f"instance_{i}")
+                if app_key is None:
+                    app_key = app_assignments.get("default")
+            self.ensure_tracker(name, device_id, app_key=app_key, app_assignments=app_assignments)
+            if len(self.trackers) > before:
+                added += 1
+
+        for device_id in ADBController.discover_devices():
+            if device_id in seen_devices:
+                continue
+            seen_devices.add(device_id)
+            if self.find_by_device(device_id):
+                continue
+            name = f"adb_{len(self.trackers) + 1}"
+            app_key = app_assignments.get("default") if app_assignments else None
+            self.ensure_tracker(name, device_id, app_key=app_key, app_assignments=app_assignments)
+            added += 1
+
+        if added:
+            logger.info(f"Synced manager; added {added} tracker(s), total {len(self.trackers)}")
+        return added
+
     def get(self, name: str) -> InstanceTracker:
         return self.trackers[name]
 

@@ -53,6 +53,18 @@ class BaseApp:
         self.GOOGLE_PLAY_X = app_cfg.get("google_play_x_coords", (490, 260))
         self.OK_BTN = app_cfg.get("ok_button_coords", (310, 565))
 
+    def should_stop(self) -> bool:
+        return bool(self.stop_event and self.stop_event.is_set())
+
+    def _interruptible_sleep(self, seconds: float) -> bool:
+        """Sleep in short chunks. Returns True if stop was requested."""
+        deadline = time.time() + max(0.0, seconds)
+        while time.time() < deadline:
+            if self.should_stop():
+                return True
+            time.sleep(min(0.25, max(0.0, deadline - time.time())))
+        return self.should_stop()
+
     def is_app_running(self) -> bool:
         pkg = self.adb.get_current_package()
         return self.PACKAGE_NAME in pkg
@@ -69,34 +81,46 @@ class BaseApp:
         time.sleep(0.5)
 
     def launch(self) -> bool:
+        if self.should_stop():
+            return False
         self.close_all_bg_apps()
-        time.sleep(0.5)
+        if self._interruptible_sleep(0.5) or self.should_stop():
+            return False
         self.adb.launch_app(self.PACKAGE_NAME, self.ACTIVITY_NAME)
         if self.adb.last_error:
             logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Launch command may have failed: {self.adb.last_error}")
             return False
         # Wait up to 15s for the app to appear in the foreground
         for _ in range(30):
+            if self.should_stop():
+                return False
             time.sleep(0.5)
             if self.is_app_running():
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: App is in foreground, waiting 10s for full load")
-                time.sleep(10)  # let splash/loading finish fully
-                return True
+                if self._interruptible_sleep(10):  # let splash/loading finish fully
+                    return False
+                return not self.should_stop()
         logger.warning(f"[{self.adb.name}] {self.APP_NAME}: App did not appear in foreground after 15s")
         return False
 
     def force_restart(self):
+        if self.should_stop():
+            return
         logger.info(f"[{self.adb.name}] {self.APP_NAME}: FORCE RESTART")
         self.adb.close_app(self.PACKAGE_NAME)
-        time.sleep(1)
+        if self._interruptible_sleep(1) or self.should_stop():
+            return
         self.adb.press_key("HOME")
-        time.sleep(0.5)
+        if self._interruptible_sleep(0.5) or self.should_stop():
+            return
         self.adb.launch_app(self.PACKAGE_NAME, self.ACTIVITY_NAME)
         for _ in range(20):
+            if self.should_stop():
+                return
             time.sleep(0.5)
             if self.is_app_running():
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: App back in foreground after restart, waiting 10s")
-                time.sleep(10)
+                self._interruptible_sleep(10)
                 return
         logger.warning(f"[{self.adb.name}] {self.APP_NAME}: App did not appear after restart")
 
@@ -657,11 +681,13 @@ class BaseApp:
         ads_this_cycle = 0
         max_ads_per_cycle = 3
         while ads_this_cycle < max_ads_per_cycle:
+            if self.should_stop():
+                return "stopped"
             if self.go_to_ad_page():
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: Continuing ads after date trick (attempt {ads_this_cycle + 1}/{max_ads_per_cycle})")
                 ads_before = self.ads_watched
                 result = self._aggressive_watch_now()
-                if result in ("switch_app", "date_trick_blocked"):
+                if result in ("switch_app", "date_trick_blocked", "stopped"):
                     return result
                 if self.ads_watched > ads_before:
                     ads_this_cycle += self.ads_watched - ads_before
@@ -672,7 +698,8 @@ class BaseApp:
                     if dl:
                         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Daily limit reached again after date trick")
                         break
-                time.sleep(1)
+                if self._interruptible_sleep(1):
+                    return "stopped"
             else:
                 logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Could not reach ad page after date trick")
                 break
@@ -685,20 +712,26 @@ class BaseApp:
         self._started_at = time.time()
 
         # Always start from a clean app session.
+        if self.should_stop():
+            return "stopped"
         self.launch()
 
         while True:
-            if self.stop_event and self.stop_event.is_set():
+            if self.should_stop():
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: Stop requested")
                 return "stopped"
 
             self.clear_stuck_dialogs()
+            if self.should_stop():
+                return "stopped"
             state = self.detect_state()
             logger.info(f"[{self.adb.name}] {self.APP_NAME}: State: {state.value}")
 
             # Already in ad — wait for it
             if state == AppState.AD_PLAYING:
                 result = self.handle_ad_result()
+                if self.should_stop() or result == "stopped":
+                    return "stopped"
                 if result:
                     return result
                 continue
@@ -706,6 +739,8 @@ class BaseApp:
             # Daily limit dialog
             if state == AppState.DAILY_LIMIT:
                 result = self.handle_daily_limit()
+                if self.should_stop() or result == "stopped":
+                    return "stopped"
                 if result:
                     return result
                 continue
@@ -716,7 +751,8 @@ class BaseApp:
                         f"[{self.adb.name}] {self.APP_NAME}: Loading during post-ad grace; "
                         "waiting for reward/ad page to settle"
                     )
-                    time.sleep(3)
+                    if self._interruptible_sleep(3):
+                        return "stopped"
                     continue
 
                 if time.time() < self._daily_limit_grace_until:
@@ -724,7 +760,8 @@ class BaseApp:
                         f"[{self.adb.name}] {self.APP_NAME}: Loading after daily-limit date change; "
                         "waiting instead of switching app"
                     )
-                    time.sleep(3)
+                    if self._interruptible_sleep(3):
+                        return "stopped"
                     self.go_to_ad_page()
                     continue
 
@@ -743,7 +780,8 @@ class BaseApp:
                     f"[{self.adb.name}] {self.APP_NAME}: Loading dialog detected; "
                     "waiting briefly (1/2)"
                 )
-                time.sleep(1)
+                if self._interruptible_sleep(1):
+                    return "stopped"
                 continue
 
             # Exit confirmation dialog
@@ -759,13 +797,20 @@ class BaseApp:
             # Need to navigate to ad page
             if state != AppState.AD_PAGE:
                 if not self.is_app_running():
+                    # stop_tracker closes the app; do not relaunch while stopping
+                    if self.should_stop():
+                        return "stopped"
                     self.launch()
                     continue
                 if not self.go_to_ad_page():
                     logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Could not navigate to ad page, retrying after delay")
-                    time.sleep(3)
+                    if self._interruptible_sleep(3):
+                        return "stopped"
                     continue
                 state = self.detect_state()
+
+            if self.should_stop():
+                return "stopped"
 
             # We should be on AD_PAGE now — try to click Watch Now aggressively
             if state == AppState.AD_PAGE:
@@ -774,14 +819,18 @@ class BaseApp:
                     if not self._advance_fake_date("post-loading retry"):
                         return "date_trick_blocked"
                     self._in_post_ad_retry = False
-                    time.sleep(1)
+                    if self._interruptible_sleep(1):
+                        return "stopped"
                 result = self._aggressive_watch_now()
+                if self.should_stop() or result == "stopped":
+                    return "stopped"
                 if result in ("switch_app", "date_trick_blocked"):
                     return result
             else:
                 # Unknown state — retry navigation on next loop. Do not press BACK here;
                 # on the home screen that opens the exit confirmation dialog.
-                time.sleep(2)
+                if self._interruptible_sleep(2):
+                    return "stopped"
 
     def _record_ad_load_success(self):
         if self.failed_ad_load_batches:
@@ -1348,23 +1397,30 @@ class BaseApp:
         reward_x_clicks = 0
 
         while time.time() - start < 90:
+            if self.should_stop():
+                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Stop requested during ad wait")
+                return "stopped"
+
             elapsed = time.time() - start
             focus_state = self._focus_state()
 
             if focus_state in ("google_play", "browser"):
                 self._recover_from_redirect(focus_state)
-                time.sleep(2)
+                if self._interruptible_sleep(2):
+                    return "stopped"
                 continue
 
             if focus_state == "other":
                 # Transient overlay/notification — wait briefly for it to pass
-                time.sleep(1)
+                if self._interruptible_sleep(1):
+                    return "stopped"
                 focus_state = self._focus_state()
                 if focus_state in ("ours", "ad"):
                     continue  # came back, keep going
                 if focus_state in ("google_play", "browser"):
                     self._recover_from_redirect(focus_state)
-                    time.sleep(2)
+                    if self._interruptible_sleep(2):
+                        return "stopped"
                     continue
                 # Still "other" — press BACK once
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: Focus still away, pressing BACK")
@@ -1372,7 +1428,8 @@ class BaseApp:
                     self.adb.press_key("BACK")
                 except Exception:
                     pass
-                time.sleep(2)
+                if self._interruptible_sleep(2):
+                    return "stopped"
                 continue
 
             if focus_state == "ours":
@@ -1384,7 +1441,8 @@ class BaseApp:
                 else:
                     # Back to our app — look for reward dialog
                     logger.info(f"[{self.adb.name}] {self.APP_NAME}: Focus returned after {elapsed:.0f}s")
-                    time.sleep(2)
+                    if self._interruptible_sleep(2):
+                        return "stopped"
 
                     # Check reward FIRST — it sits on top of daily limit dialog
                     if self._tap_reward_ok(timeout=6):
@@ -1394,6 +1452,9 @@ class BaseApp:
                         self._post_ad_grace_until = 0
                         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad #{self.ads_watched} collected!")
                         return
+
+                    if self.should_stop():
+                        return "stopped"
 
                     state = self.detect_state()
                     if state in (AppState.REWARD_RECEIVED, AppState.REWARD_GRANTED):
@@ -1428,7 +1489,8 @@ class BaseApp:
                     # Fallback: we just came back from ad, assume reward — tap OK position
                     logger.info(f"[{self.adb.name}] {self.APP_NAME}: Tapping OK position (fallback)")
                     self.adb.tap(*self.OK_BTN)
-                    time.sleep(2)
+                    if self._interruptible_sleep(2):
+                        return "stopped"
                     self.ads_watched += 1
                     self._record_ad_load_success()
                     self.post_ad_loading_retries = 0
@@ -1457,7 +1519,8 @@ class BaseApp:
                         pos = (tap_x, tap_y)
                         now = time.time()
                         if pos == last_click_pos and now - last_click_time < 3:
-                            time.sleep(0.3)
+                            if self._interruptible_sleep(0.3):
+                                return "stopped"
                             continue
                         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Found {name} at ({cx},{cy}), tapping ({tap_x},{tap_y})...")
                         self.adb.tap(tap_x, tap_y)
@@ -1466,22 +1529,26 @@ class BaseApp:
                         if name == "continue_btn":
                             if self._wait_for_x_after_continue(timeout=8):
                                 continue
-                        time.sleep(0.5)
+                        if self._interruptible_sleep(0.5):
+                            return "stopped"
                         continue
 
                     # Fallback: if ad is stuck for > 40s and template matching hasn't found a close button,
                     # try tapping the top corners (e.g. for dark/unrecognized reward pills).
                     if elapsed > 70 and self._tap_reward_granted_x(frame):
                         reward_x_clicks += 1
-                        time.sleep(1)
+                        if self._interruptible_sleep(1):
+                            return "stopped"
                         if reward_x_clicks >= 3 and self._check_focus() == "away":
                             logger.info(f"[{self.adb.name}] {self.APP_NAME}: Reward X did not close ad, pressing BACK")
                             self.go_back()
                             reward_x_clicks = 0
-                            time.sleep(2)
+                            if self._interruptible_sleep(2):
+                                return "stopped"
                         continue
 
-            time.sleep(1)
+            if self._interruptible_sleep(1):
+                return "stopped"
 
         logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Ad wait timed out (90s)")
         self.go_back()

@@ -86,11 +86,16 @@ def run_instance(tracker):
     if not tracker.app_key:
         logger.warning(f"[{name}] No app assigned, skipping")
         tracker.last_result = "no_app"
+        tracker.running = False
         return
 
     logger.info(f"[{name}] Starting {tracker.app_key} automation")
-    tracker.prepare_start()
-    tracker.running = True
+    # start_tracker may already have claimed running=True and cleared stop_event.
+    if not tracker.running:
+        tracker.prepare_start()
+        tracker.running = True
+    elif tracker.app:
+        tracker.app.stop_event = tracker.stop_event
 
     try:
         while tracker.app and not tracker.stop_event.is_set():
@@ -102,6 +107,7 @@ def run_instance(tracker):
                 tracker.ads_by_app[running_app] = tracker.ads_by_app.get(running_app, 0) + max(0, ads_after - ads_before)
             tracker.last_result = result or "loop_complete"
             if result == "stopped" or tracker.stop_event.is_set():
+                tracker.last_result = "stopped"
                 break
             if result not in ("switch_app", "date_trick_blocked"):
                 break
@@ -157,6 +163,22 @@ def build_manager(app_assignments: dict[str, str] | None = None) -> InstanceMana
     return InstanceManager.auto_discover(app_assignments or default_app_assignments())
 
 
+def refresh_manager(
+    manager: InstanceManager | None,
+    app_assignments: dict[str, str] | None = None,
+    connect: bool = True,
+) -> InstanceManager:
+    """Return a manager, creating one only if needed; never replaces live trackers."""
+    assignments = app_assignments or default_app_assignments()
+    if manager is None:
+        manager = build_manager(assignments)
+    else:
+        manager.sync_from_bluestacks(assignments)
+    if connect:
+        connect_manager(manager)
+    return manager
+
+
 def connect_manager(manager: InstanceManager) -> dict[str, bool]:
     online = manager.connect_all()
     connected_count = sum(1 for ok in online.values() if ok)
@@ -194,6 +216,10 @@ def start_tracker(tracker) -> bool:
     if not tracker.app:
         logger.warning(f"[{tracker.adb.name}] Select an app before starting")
         return False
+    tracker.prepare_start()
+    # Claim the slot immediately so batch polling does not treat this as finished
+    # before the worker thread enters run_instance.
+    tracker.running = True
     thread = threading.Thread(target=run_instance, args=(tracker,), daemon=True)
     tracker.thread = thread
     thread.start()
@@ -201,9 +227,31 @@ def start_tracker(tracker) -> bool:
 
 
 def stop_tracker(tracker) -> None:
+    name = tracker.adb.name
+    if not tracker.running and not tracker.stop_event.is_set():
+        logger.info(f"[{name}] Stop requested but tracker is not running")
+        tracker.last_result = "stopped"
+        return
+
+    logger.info(f"[{name}] Stop requested")
     tracker.request_stop()
+
     if tracker.app:
         try:
             tracker.adb.close_app(tracker.app.PACKAGE_NAME)
         except Exception as e:
-            logger.warning(f"[{tracker.adb.name}] Stop close-app failed: {e}")
+            logger.warning(f"[{name}] Stop close-app failed: {e}")
+
+    # Wait briefly for the worker thread to exit after close-app + stop_event.
+    thread = tracker.thread
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=8)
+        if thread.is_alive():
+            logger.warning(f"[{name}] Worker still running after stop request")
+            tracker.last_result = "stopping"
+        else:
+            tracker.last_result = "stopped"
+            tracker.running = False
+    else:
+        tracker.running = False
+        tracker.last_result = "stopped"
