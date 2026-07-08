@@ -271,7 +271,11 @@ class BatchRunner:
             self._settle([ready])
 
             if self._stopping:
-                self.bs_manager.stop_instance(ready.name)
+                self.bs_manager.stop_instance(
+                    ready.name,
+                    display_name=ready.display_name,
+                    device_id=ready.device_id,
+                )
                 return False
 
             manager = refresh_manager(self._get_manager(), default_app_assignments(), connect=True)
@@ -286,7 +290,11 @@ class BatchRunner:
                 slot.state = SlotState.FAILED
                 slot.error = "ADB connect failed"
                 logger.warning(f"Batch: could not connect ADB for {name}")
-                self.bs_manager.stop_instance(ready.name)
+                self.bs_manager.stop_instance(
+                    ready.name,
+                    display_name=ready.display_name,
+                    device_id=ready.device_id,
+                )
                 return False
 
             if not tracker.app:
@@ -298,7 +306,11 @@ class BatchRunner:
                 slot.state = SlotState.FAILED
                 slot.error = "failed to start automation"
                 logger.warning(f"Batch: failed to start automation on {name}")
-                self.bs_manager.stop_instance(ready.name)
+                self.bs_manager.stop_instance(
+                    ready.name,
+                    display_name=ready.display_name,
+                    device_id=ready.device_id,
+                )
                 return False
 
             slot.tracker_name = tracker.adb.name
@@ -313,7 +325,11 @@ class BatchRunner:
             logger.error(f"Batch: error starting {name}: {e}")
             self._on_message(f"Batch: failed to start {name}: {e}")
             try:
-                self.bs_manager.stop_instance(inst.name)
+                self.bs_manager.stop_instance(
+                    inst.name,
+                    display_name=inst.display_name,
+                    device_id=inst.device_id,
+                )
             except Exception:
                 pass
             return False
@@ -362,18 +378,32 @@ class BatchRunner:
         self._on_message(msg)
 
     def _teardown_slot(self, slot: BatchSlot, mark_failed: bool, reason: str) -> None:
+        name = slot.instance.display_name
         tracker = self._resolve_tracker(slot)
         if tracker:
             try:
                 if tracker.running or tracker.stop_event.is_set():
                     stop_tracker(tracker)
             except Exception as e:
-                logger.warning(f"Batch: stop_tracker failed for {slot.instance.display_name}: {e}")
+                logger.warning(f"Batch: stop_tracker failed for {name}: {e}")
 
+        # Always close the BlueStacks window for this slot before starting the next one.
+        self._on_message(f"Batch: closing {name}...")
         try:
-            self.bs_manager.stop_instance(slot.instance.name)
+            stopped = self.bs_manager.stop_instance(
+                slot.instance.name,
+                display_name=slot.instance.display_name,
+                device_id=slot.device_id or slot.instance.device_id,
+            )
+            if stopped:
+                logger.info(f"Batch: closed BlueStacks instance {name}")
+            else:
+                logger.warning(f"Batch: could not confirm close for {name}")
         except Exception as e:
-            logger.warning(f"Batch: stop_instance failed for {slot.instance.display_name}: {e}")
+            logger.warning(f"Batch: stop_instance failed for {name}: {e}")
+
+        # Brief pause so the OS releases RAM/ADB before the next instance boots.
+        time.sleep(2)
 
         if mark_failed:
             slot.state = SlotState.FAILED
