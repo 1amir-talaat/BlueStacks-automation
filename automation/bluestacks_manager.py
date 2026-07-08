@@ -114,35 +114,196 @@ class BlueStacksManager:
         subprocess.Popen([str(PLAYER_PATH), "--instance", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
 
-    def stop_instance(self, name: str) -> bool:
-        """Best-effort stop of one BlueStacks instance by killing its HD-Player process."""
-        pids = self._find_player_pids(name)
+    def stop_instance(
+        self,
+        name: str,
+        display_name: str | None = None,
+        device_id: str | None = None,
+    ) -> bool:
+        """Best-effort stop of one BlueStacks instance by killing its HD-Player process.
+
+        CommandLine is often unavailable without elevation, so we also match by
+        window title (display name) and ADB listen port.
+        """
+        inst = self.get_instance(name)
+        title = display_name or (inst.display_name if inst else name)
+        ports: list[int] = list(inst.candidate_ports()) if inst else []
+        if device_id and ":" in device_id:
+            try:
+                port = int(device_id.rsplit(":", 1)[1])
+                if port not in ports:
+                    ports.append(port)
+            except ValueError:
+                pass
+
+        pids = self._find_player_pids(name, display_name=title, ports=ports)
         if not pids:
+            # Last resort: filter taskkill by exact window title.
+            if self._taskkill_by_window_title(title):
+                logger.info(f"Stopped BlueStacks instance {name} via window title '{title}'")
+                return True
             logger.info(f"No running HD-Player process found for instance {name}")
             return True
 
         killed = 0
         for pid in pids:
-            try:
-                result = subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if result.returncode == 0:
-                    killed += 1
-                    logger.info(f"Stopped BlueStacks instance {name} (pid {pid})")
-                else:
-                    detail = (result.stderr or result.stdout or "").strip()
-                    logger.warning(f"taskkill failed for {name} pid {pid}: {detail}")
-            except (subprocess.TimeoutExpired, OSError) as e:
-                logger.warning(f"Failed to stop BlueStacks instance {name} pid {pid}: {e}")
+            if self._kill_pid(pid):
+                killed += 1
+                logger.info(f"Stopped BlueStacks instance {name} (pid {pid})")
         return killed > 0
 
-    def _find_player_pids(self, instance_name: str) -> list[int]:
-        """Return HD-Player PIDs whose command line includes --instance <name>."""
-        # Prefer PowerShell CIM for reliable command-line matching on Windows.
+    def _kill_pid(self, pid: int) -> bool:
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0:
+                return True
+            detail = (result.stderr or result.stdout or "").strip()
+            logger.warning(f"taskkill failed for pid {pid}: {detail}")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.warning(f"Failed to kill pid {pid}: {e}")
+        return False
+
+    def _taskkill_by_window_title(self, title: str) -> bool:
+        if not title:
+            return False
+        try:
+            # Exact window title match (e.g. "BlueStacks App Player").
+            result = subprocess.run(
+                ["taskkill", "/FI", f"WINDOWTITLE eq {title}", "/IM", "HD-Player.exe", "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            out = (result.stdout or "") + (result.stderr or "")
+            return result.returncode == 0 and "SUCCESS" in out.upper()
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.warning(f"taskkill by window title failed for '{title}': {e}")
+            return False
+
+    def _find_player_pids(
+        self,
+        instance_name: str,
+        display_name: str | None = None,
+        ports: list[int] | None = None,
+    ) -> list[int]:
+        """Return HD-Player PIDs for one instance using several matching strategies."""
+        player_pids = set(self._all_hd_player_pids())
+        found: list[int] = []
+
+        def add(pid: int) -> None:
+            # Never kill non-player PIDs that happen to listen on a conf port.
+            if pid in player_pids and pid not in found:
+                found.append(pid)
+
+        # 1) ADB listen port → owning HD-Player PID (most reliable here).
+        for port in ports or []:
+            for pid in self._pids_listening_on_port(port):
+                add(pid)
+        if found:
+            return found
+
+        # 2) Exact MainWindowTitle == display name.
+        if display_name:
+            for pid in self._pids_by_window_title(display_name):
+                add(pid)
+        if found:
+            return found
+
+        # 3) Command line --instance <name> (works when process ACL exposes cmdline).
+        for pid in self._pids_by_command_line_instance(instance_name):
+            add(pid)
+        return found
+
+    def _all_hd_player_pids(self) -> list[int]:
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq HD-Player.exe", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return []
+
+        pids: list[int] = []
+        for line in result.stdout.splitlines():
+            # "HD-Player.exe","38884","Console","1","..."
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) < 2 or parts[0].lower() != "hd-player.exe":
+                continue
+            try:
+                pids.append(int(parts[1]))
+            except ValueError:
+                continue
+        return pids
+
+    def _pids_listening_on_port(self, port: int) -> list[int]:
+        pids: list[int] = []
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.warning(f"netstat failed while looking for port {port}: {e}")
+            return []
+
+        needle = f"127.0.0.1:{port}"
+        for line in result.stdout.splitlines():
+            if "LISTENING" not in line.upper() or needle not in line:
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            try:
+                pid = int(parts[-1])
+            except ValueError:
+                continue
+            if pid > 0 and pid not in pids:
+                pids.append(pid)
+        return pids
+
+    def _pids_by_window_title(self, display_name: str) -> list[int]:
+        # Escape single quotes for PowerShell string.
+        safe = display_name.replace("'", "''")
+        ps_script = (
+            f"Get-Process HD-Player -ErrorAction SilentlyContinue | "
+            f"Where-Object {{ $_.MainWindowTitle -eq '{safe}' }} | "
+            f"Select-Object -ExpandProperty Id"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.warning(f"Could not query HD-Player window titles: {e}")
+            return []
+
+        pids: list[int] = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                pids.append(int(line))
+            except ValueError:
+                continue
+        return pids
+
+    def _pids_by_command_line_instance(self, instance_name: str) -> list[int]:
+        """Match --instance <name> with word-boundary so Pie64 does not match Pie64_4."""
+        import json
+
         ps_script = (
             "Get-CimInstance Win32_Process -Filter \"Name = 'HD-Player.exe'\" | "
             "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
@@ -161,27 +322,28 @@ class BlueStacksManager:
         if result.returncode != 0 or not result.stdout.strip():
             return []
 
-        import json
-
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError:
-            logger.warning("Could not parse HD-Player process list")
             return []
 
         if isinstance(data, dict):
             data = [data]
 
-        needle = f"--instance {instance_name}"
-        needle_eq = f"--instance={instance_name}"
+        # Require exact instance token after --instance (space or =), not a prefix of another name.
+        pattern = re.compile(
+            rf"(?:--instance[= ]|--instance\s+){re.escape(instance_name)}(?:\s|$)",
+            re.IGNORECASE,
+        )
         pids: list[int] = []
         for entry in data:
             cmdline = entry.get("CommandLine") or ""
-            if needle in cmdline or needle_eq in cmdline:
-                try:
-                    pids.append(int(entry["ProcessId"]))
-                except (KeyError, TypeError, ValueError):
-                    continue
+            if not cmdline or not pattern.search(cmdline):
+                continue
+            try:
+                pids.append(int(entry["ProcessId"]))
+            except (KeyError, TypeError, ValueError):
+                continue
         return pids
 
     def is_device_online(self, device_id: str) -> bool:
