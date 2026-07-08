@@ -15,9 +15,17 @@ from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 
+from automation.batch_runner import BatchRunner
 from automation.bluestacks_manager import BlueStacksManager
 from automation.instance_manager import APP_CLASSES
-from automation.runtime import build_manager, connect_manager, reset_online_dates, start_tracker, stop_tracker
+from automation.runtime import (
+    build_manager,
+    connect_manager,
+    refresh_manager,
+    reset_online_dates,
+    start_tracker,
+    stop_tracker,
+)
 from utils.logger import LOG_STORE, set_console_logging, setup_logger
 
 logger = setup_logger("tui")
@@ -45,12 +53,13 @@ class AutomationTUI:
         self.bs_manager = BlueStacksManager()
         self.bs_instances = []
         self.selected_bs = 0
-        self.batch_size = 2
-        self.batch_index = 0
-        self.active_batch_devices = set()
-        self.completed_batch_devices = set()
-        self.batch_running = False
-        self.batch_grace_until = 0.0
+        self.batch_runner = BatchRunner(
+            bs_manager=self.bs_manager,
+            get_manager=lambda: self.manager,
+            set_manager=self._set_manager,
+            on_message=self._batch_message,
+            settle_seconds=BLUESTACKS_SETTLE_SECONDS,
+        )
         self.selected = 0
         self.status_rows = []
         self.command_message = "Starting dashboard..."
@@ -61,13 +70,20 @@ class AutomationTUI:
         self._visible_log_rows = []
         self.executor = ThreadPoolExecutor(max_workers=6)
         self._status_lock = threading.Lock()
-        self._batch_lock = threading.Lock()
         self._status_refreshing = False
         self._last_status_refresh = 0.0
         self._last_render = 0.0
         self._dirty = True
         self._busy_actions = set()
         self._quit = False
+
+    def _set_manager(self, manager):
+        self.manager = manager
+        self._dirty = True
+
+    def _batch_message(self, message: str):
+        self.command_message = message
+        self._dirty = True
 
     def run(self):
         import msvcrt
@@ -87,7 +103,7 @@ class AutomationTUI:
                     self.handle_key(key)
                     handled += 1
                 now = time.time()
-                self.check_batch_progress()
+                self.batch_runner.tick()
                 if self._dirty or now - self._last_render >= 0.25:
                     live.update(self.render(), refresh=True)
                     self._last_render = now
@@ -107,14 +123,18 @@ class AutomationTUI:
 
         def wrapped():
             try:
-                func(*args)
-                self.command_message = f"Done: {name}."
+                result = func(*args)
+                if result is not None:
+                    self.command_message = str(result)
+                else:
+                    self.command_message = f"Done: {name}."
             except Exception as e:
                 self.command_message = f"Failed {name}: {e}"
                 logger.error(f"TUI action '{name}' failed: {e}")
             finally:
                 self._busy_actions.discard(name)
                 self.action_state = "Idle" if not self._busy_actions else f"Running: {', '.join(sorted(self._busy_actions))}"
+                self._dirty = True
 
         self.executor.submit(wrapped)
         self._dirty = True
@@ -122,10 +142,19 @@ class AutomationTUI:
 
     def discover(self, connect: bool = False):
         self.bs_instances = self.bs_manager.list_instances()
-        self.manager = build_manager()
-        self.selected = 0
-        if connect:
-            self.connect_all()
+        keep_alive = (
+            self.batch_runner.active
+            or (self.manager is not None and self.manager.has_running())
+        )
+        if keep_alive and self.manager is not None:
+            # Never rebuild trackers while automation or a batch is live.
+            self.manager = refresh_manager(self.manager, connect=connect)
+            self.command_message = "Rediscovered instances (kept live trackers)."
+        else:
+            self.manager = build_manager()
+            self.selected = 0
+            if connect:
+                self.connect_all()
         self._refresh_status_sync(force=True)
 
     def connect_all(self):
@@ -178,10 +207,16 @@ class AutomationTUI:
             self.submit_action("open multi-instance manager", self.bs_manager.open_multi_instance_manager)
             return
         if key == "2":
-            self.submit_action("batch run", self.start_batch_run, 2)
+            self.start_batch(2)
             return
         if key == "1":
-            self.submit_action("batch run", self.start_batch_run, 1)
+            self.start_batch(1)
+            return
+        if key == "0":
+            if self.batch_runner.active:
+                self.submit_action("stop batch", self.batch_runner.stop)
+            else:
+                self.command_message = "No batch is running."
             return
         if key == "n":
             self.move_selection(1)
@@ -325,120 +360,15 @@ class AutomationTUI:
         self.command_message = f"Ready {ready}/{len(self.bs_instances)} BlueStacks instance(s)."
         self.discover(connect=True)
 
-    def start_batch_run(self, size: int = 2):
-        if self.batch_running:
-            self.command_message = "A batch is already running. Stop it before starting another batch."
+    def start_batch(self, concurrency: int):
+        if self.batch_runner.active:
+            self.command_message = "A batch is already running. Press 0 to stop it."
             return
-        if self.manager:
-            running = [tracker.adb.name for tracker in self.manager.get_all() if tracker.running]
-            if running:
-                self.command_message = f"Stop running automation first: {', '.join(running)}"
-                return
+        # start() is non-blocking for long work (fill runs on its own thread)
+        message = self.batch_runner.start(concurrency)
+        self.command_message = message
         self.bs_instances = self.bs_manager.list_instances()
-        self.batch_size = max(1, size)
-        self.batch_index = 0
-        self.batch_running = True
-        self.active_batch_devices = set()
-        self.completed_batch_devices = set()
-        self.start_next_batch()
-
-    def start_next_batch(self):
-        if not self._batch_lock.acquire(blocking=False):
-            self.command_message = "Batch transition is already running."
-            return
-        try:
-            self._start_next_batch_locked()
-        finally:
-            self._batch_lock.release()
-
-    def _start_next_batch_locked(self):
-        if not self.batch_running:
-            return
-        open_slots = max(1, self.batch_size - len(self.active_batch_devices))
-        batch = self.next_batch_instances(open_slots)
-        if not batch:
-            if not self.active_batch_devices:
-                self.batch_running = False
-                self.completed_batch_devices = set()
-                self.command_message = "Batch run complete."
-            return
-
-        ready = 0
-        ready_instances = []
-        for inst in batch:
-            self.command_message = f"Batch: starting {inst.display_name}; waiting for ADB..."
-            ready_inst = self.bs_manager.resolve_online_instance(inst)
-            if not ready_inst:
-                self.bs_manager.start_instance(inst.name)
-                ready_inst = self.bs_manager.wait_for_instance(inst)
-            if ready_inst:
-                ready += 1
-                ready_instances.append(ready_inst)
-
-        self.wait_for_bluestacks_settle(ready_instances)
-        self.active_batch_devices.update(inst.device_id for inst in ready_instances if inst.device_id)
-
-        self.discover(connect=True)
-        started = 0
-        for tracker in self.manager.get_all():
-            if tracker.adb.device_id in self.active_batch_devices and not tracker.running:
-                if start_tracker(tracker):
-                    started += 1
-                    if started >= self.batch_size:
-                        break
-        if started:
-            self.batch_grace_until = time.time() + 10
-        self.command_message = f"Batch slot ready {ready}/{len(batch)}; automation started on {started}."
-
-    def next_batch_instances(self, limit: int | None = None):
-        if not self.bs_instances:
-            return []
-        running_devices = set()
-        if self.manager:
-            running_devices = {tracker.adb.device_id for tracker in self.manager.get_all() if tracker.running}
-
-        selected = []
-        limit = limit or self.batch_size
-        count = len(self.bs_instances)
-        for _ in range(count):
-            inst = self.bs_instances[self.batch_index % count]
-            self.batch_index += 1
-            if (
-                not inst.device_id
-                or inst.device_id in running_devices
-                or inst.device_id in self.active_batch_devices
-                or inst.device_id in self.completed_batch_devices
-            ):
-                continue
-            selected.append(inst)
-            if len(selected) >= limit:
-                break
-        return selected
-
-    def is_bluestacks_online(self, inst):
-        if not inst.device_id or not self.manager:
-            return False
-        for tracker in self.manager.get_all():
-            if tracker.adb.device_id == inst.device_id:
-                return tracker.adb.is_online()
-        return False
-
-    def check_batch_progress(self):
-        if not self.batch_running or not self.active_batch_devices or not self.manager:
-            return
-        if time.time() < self.batch_grace_until:
-            return
-        active = [
-            tracker for tracker in self.manager.get_all()
-            if tracker.adb.device_id in self.active_batch_devices
-        ]
-        finished_devices = {tracker.adb.device_id for tracker in active if not tracker.running}
-        if finished_devices:
-            self.active_batch_devices.difference_update(finished_devices)
-            self.completed_batch_devices.update(finished_devices)
-
-        if len(self.active_batch_devices) < self.batch_size:
-            self.submit_action("next batch", self.start_next_batch)
+        self._dirty = True
 
     def find_bluestacks_by_device(self, device_id: str):
         if not self.bs_instances:
@@ -499,7 +429,18 @@ class AutomationTUI:
         if not tracker:
             self.command_message = "No selected instance."
             return
-        self.submit_action(f"stop {tracker.adb.name}", stop_tracker, tracker)
+        if not tracker.running and not tracker.stop_event.is_set():
+            self.command_message = f"{tracker.adb.name} is already stopped."
+            return
+        self.command_message = f"Stopping {tracker.adb.name}..."
+        self.submit_action(f"stop {tracker.adb.name}", self._stop_tracker_and_refresh, tracker)
+
+    def _stop_tracker_and_refresh(self, tracker):
+        stop_tracker(tracker)
+        self._refresh_status_sync(force=True)
+        if tracker.running:
+            return f"{tracker.adb.name} is stopping..."
+        return f"Stopped {tracker.adb.name}."
 
     def reset_dates(self):
         if not self.manager:
@@ -621,7 +562,7 @@ class AutomationTUI:
         layout.split_column(
             Layout(self.hero_panel(), name="header", size=6),
             Layout(name="body", ratio=1),
-            Layout(self.status_bar(), name="status", size=3),
+            Layout(self.status_bar(), name="status", size=4),
         )
         layout["body"].split_row(
             Layout(self.instances_panel(), name="instances", size=34),
@@ -889,7 +830,9 @@ class AutomationTUI:
             ("e/f", "export logs"),
             ("j/k", "select BS"),
             ("m/h", "start BS/all"),
-            ("1/2", "batch size"),
+            ("1", "batch 1-at-a-time"),
+            ("2", "batch 2-at-a-time"),
+            ("0", "stop batch"),
             ("z", "multi-instance mgr"),
             ("d/c", "discover/connect"),
             ("q", "quit"),
@@ -903,11 +846,14 @@ class AutomationTUI:
         text.append(" ")
         text.append(self.command_message, style=f"bold {THEME['gold']}")
         text.append("   ")
+        text.append(" BATCH ", style=f"bold #020617 on {THEME['green']}")
+        text.append(f" {self.batch_runner.status_text()}", style=THEME["green"])
+        text.append("   ")
         text.append(" LOGS ", style=f"bold #020617 on {THEME['purple']}")
         text.append(f" {self.log_mode}", style=THEME["purple"])
         text.append("   ")
         text.append(" SHORTCUTS ", style=f"bold #020617 on {THEME['cyan']}")
-        text.append(" 1/2 batch run  m start BS  arrows scroll  u/y copy  q quit", style=THEME["cyan"])
+        text.append(" 1/2 batch  0 stop batch  m start BS  q quit", style=THEME["cyan"])
         return Panel(text, border_style=THEME["border"], box=box.ROUNDED)
 
     def key_hint(self, key: str, label: str) -> Text:
@@ -917,6 +863,11 @@ class AutomationTUI:
         return text
 
     def shutdown(self):
+        try:
+            if self.batch_runner.active:
+                self.batch_runner.stop()
+        except Exception:
+            pass
         if self.manager:
             for tracker in self.manager.get_all():
                 tracker.request_stop()

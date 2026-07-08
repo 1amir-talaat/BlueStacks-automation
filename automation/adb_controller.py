@@ -60,13 +60,18 @@ class ADBController:
         return False
 
     def connect(self) -> bool:
+        # TCP BlueStacks endpoints need an explicit connect before get-state.
+        if ":" in self.device_id:
+            self._run(["connect", self.device_id], timeout=5)
         result = self._run(["-s", self.device_id, "get-state"], timeout=5)
-        output = result.stdout.strip()
-        if "device" in output:
+        output = result.stdout.strip() or result.stderr.strip()
+        if "device" in result.stdout.strip():
             self.connected = True
             self.last_error = ""
             logger.info(f"[{self.name}] Connected ({self.device_id})")
             return True
+        self.connected = False
+        self.last_error = output or "not online"
         logger.warning(f"[{self.name}] Not online: {output}")
         return False
 
@@ -75,12 +80,16 @@ class ADBController:
         logger.info(f"[{self.name}] Disconnected")
 
     def is_online(self) -> bool:
+        if ":" in self.device_id:
+            self._run(["connect", self.device_id], timeout=5)
         result = self._run(["-s", self.device_id, "get-state"], timeout=5)
         if "device" in result.stdout.strip():
+            self.connected = True
             return True
         if result.returncode != 0:
             self.last_error = result.stderr.strip() or self.last_error
-        return "device" in result.stdout.strip()
+        self.connected = False
+        return False
 
     def shell(self, command: str, timeout: int = 10) -> str:
         result = self._run(["-s", self.device_id, "shell", command], timeout=timeout)

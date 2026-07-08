@@ -42,13 +42,16 @@ python main.py
 
 ### TUI Controls
 
+- `1` **batch run (1 at a time)** — open the first BlueStacks instance, farm ads until it finishes, stop it, then move to the next instance, and so on
+- `2` **batch run (2 at a time)** — keep up to two instances busy; when one finishes, start the next pending instance
+- `0` stop the active batch (also stops its instances)
 - `d` discover and reconnect BlueStacks instances
 - `c` connect all discovered instances
 - `j` / `k` select an installed BlueStacks instance
 - `m` start the selected BlueStacks instance
 - `h` start all detected BlueStacks instances
 - `z` open BlueStacks Multi-instance Manager
-- `a` start automation on all instances
+- `a` start automation on all *already online* instances (not a queued batch)
 - `s` start the selected instance
 - `x` stop the selected instance
 - `t` switch the selected stopped instance between apps
@@ -64,6 +67,17 @@ python main.py
 - `n` / `p` move selection next/previous
 - `r` refresh status
 - `q` quit
+
+### Batch mode
+
+Batch mode walks every installed BlueStacks instance (from `bluestacks.conf`):
+
+1. Starts the next instance(s) with `HD-Player`
+2. Waits for ADB, settles, and starts ad automation
+3. When a worker finishes (both apps exhausted / `done_today`, or stop), closes that instance
+4. Fills free concurrency slots from the remaining queue until the list is done
+
+Do not use `a`/`s` while a batch is running. Discover (`d`) keeps live trackers intact during a batch.
 
 Legacy plain console mode is still available:
 
