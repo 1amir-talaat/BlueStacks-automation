@@ -438,31 +438,32 @@ class BaseApp:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # --- GetSMS theme: white dialog + blue spinner ---
-        # The whole screen is dimmed behind the dialog, so the white popup can
-        # appear gray in screenshots. Keep the threshold lower than pure white.
-        bright = cv2.inRange(gray, 150, 255)
-        bright_contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in bright_contours:
-            area = cv2.contourArea(contour)
-            if area < 2500:
-                continue
-            x, y, cw, ch = cv2.boundingRect(contour)
-            aspect = cw / max(ch, 1)
-            if 1.8 <= aspect <= 4.5 and 40 <= ch <= 140:
-                blue = cv2.inRange(hsv, np.array([90, 40, 70]), np.array([140, 255, 255]))
-                if cv2.countNonZero(blue) > 20:
-                    return True
+        if getattr(self, "APP_NAME", "") != "tempsms":
+            # --- GetSMS theme: white dialog + blue spinner ---
+            # The whole screen is dimmed behind the dialog, so the white popup can
+            # appear gray in screenshots. Keep the threshold lower than pure white.
+            bright = cv2.inRange(gray, 150, 255)
+            bright_contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in bright_contours:
+                area = cv2.contourArea(contour)
+                if area < 2500:
+                    continue
+                x, y, cw, ch = cv2.boundingRect(contour)
+                aspect = cw / max(ch, 1)
+                if 1.8 <= aspect <= 4.5 and 40 <= ch <= 140:
+                    blue = cv2.inRange(hsv, np.array([90, 40, 70]), np.array([140, 255, 255]))
+                    if cv2.countNonZero(blue) > 20:
+                        return True
 
-        # Fallback for GetSMS: centered white/gray popup with blue spinner.
-        center = frame[int(h * 0.36):int(h * 0.52), int(w * 0.25):int(w * 0.75)]
-        if center.size:
-            center_hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
-            center_gray = cv2.cvtColor(center, cv2.COLOR_BGR2GRAY)
-            light_ratio = cv2.countNonZero(cv2.inRange(center_gray, 145, 255)) / max(1, center_gray.size)
-            blue = cv2.inRange(center_hsv, np.array([90, 35, 60]), np.array([140, 255, 255]))
-            if light_ratio > 0.18 and cv2.countNonZero(blue) > 15:
-                return True
+            # Fallback for GetSMS: centered white/gray popup with blue spinner.
+            center = frame[int(h * 0.36):int(h * 0.52), int(w * 0.25):int(w * 0.75)]
+            if center.size:
+                center_hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+                center_gray = cv2.cvtColor(center, cv2.COLOR_BGR2GRAY)
+                light_ratio = cv2.countNonZero(cv2.inRange(center_gray, 145, 255)) / max(1, center_gray.size)
+                blue = cv2.inRange(center_hsv, np.array([90, 35, 60]), np.array([140, 255, 255]))
+                if light_ratio > 0.18 and cv2.countNonZero(blue) > 15:
+                    return True
 
         # --- TempSMS theme: dark dialog + red/pink spinner + white "Loading..." text ---
         temp_roi = frame[int(h * 0.40):int(h * 0.67), int(w * 0.25):int(w * 0.85)]
@@ -470,6 +471,19 @@ class BaseApp:
             return False
         temp_hsv = cv2.cvtColor(temp_roi, cv2.COLOR_BGR2HSV)
         temp_gray = cv2.cvtColor(temp_roi, cv2.COLOR_BGR2GRAY)
+
+        text_roi = frame[int(h * 0.48):int(h * 0.56), int(w * 0.34):int(w * 0.68)]
+        spinner_roi = frame[int(h * 0.47):int(h * 0.55), int(w * 0.28):int(w * 0.46)]
+        if text_roi.size and spinner_roi.size:
+            text_gray = cv2.cvtColor(text_roi, cv2.COLOR_BGR2GRAY)
+            spinner_hsv = cv2.cvtColor(spinner_roi, cv2.COLOR_BGR2HSV)
+            popup_gray = cv2.cvtColor(frame[int(h * 0.46):int(h * 0.59), int(w * 0.32):int(w * 0.70)], cv2.COLOR_BGR2GRAY)
+            text_pixels = cv2.countNonZero(cv2.inRange(text_gray, 150, 255))
+            dark_popup_ratio = cv2.countNonZero(cv2.inRange(popup_gray, 0, 45)) / max(1, popup_gray.size)
+            spinner_red = cv2.inRange(spinner_hsv, np.array([0, 45, 60]), np.array([18, 255, 255]))
+            spinner_red |= cv2.inRange(spinner_hsv, np.array([140, 45, 60]), np.array([180, 255, 255]))
+            if dark_popup_ratio > 0.45 and text_pixels > 35 and 6 <= cv2.countNonZero(spinner_red) <= 350:
+                return True
 
         # The purchase page is dimmed while the popup is open, so the text often
         # captures as gray rather than pure white.
@@ -490,7 +504,7 @@ class BaseApp:
         red1 = cv2.inRange(temp_hsv, np.array([0, 20, 35]), np.array([18, 255, 255]))
         red2 = cv2.inRange(temp_hsv, np.array([140, 20, 35]), np.array([180, 255, 255]))
         red_count = cv2.countNonZero(red1 | red2)
-        if red_count > 10 and (has_loading_text or has_dark_popup):
+        if red_count > 10 and has_loading_text and has_dark_popup:
             return True
 
         return False
@@ -514,10 +528,33 @@ class BaseApp:
         pink = cv2.inRange(hsv, np.array([140, 20, 30]), np.array([180, 255, 255]))
         pink |= cv2.inRange(hsv, np.array([0, 20, 30]), np.array([18, 255, 255]))
         mask = blue | pink
-        if cv2.countNonZero(mask) < 120:
-            return False
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        return any(cv2.contourArea(c) > 200 for c in contours)
+        if cv2.countNonZero(mask) >= 120:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if any(cv2.contourArea(c) > 200 for c in contours):
+                return True
+
+        if getattr(self, "APP_NAME", "") == "tempsms":
+            purchase_region = frame[int(h * 0.28):int(h * 0.75), 0:w]
+            if purchase_region.size == 0:
+                return False
+
+            hsv_purchase = cv2.cvtColor(purchase_region, cv2.COLOR_BGR2HSV)
+            yellow = cv2.inRange(hsv_purchase, np.array([18, 20, 20]), np.array([45, 255, 255]))
+            contours, _ = cv2.findContours(yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            large_buttons = 0
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 1200:
+                    continue
+                _, _, cw, ch = cv2.boundingRect(contour)
+                aspect = cw / max(ch, 1)
+                if 1.2 <= aspect <= 5.5 and 24 <= ch <= 90:
+                    large_buttons += 1
+
+            if large_buttons >= 2:
+                return True
+
+        return False
 
     def _is_in_app_ad_overlay(self, frame) -> bool:
         """Detect ad webviews that keep focus inside the app package."""
@@ -1499,6 +1536,13 @@ class BaseApp:
                         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad finished, back on ad page")
                         self.post_ad_loading_retries = 0
                         self._post_ad_grace_until = time.time() + 20
+                        return
+
+                    if frame is not None and self._is_loading_dialog(frame):
+                        logger.info(
+                            f"[{self.adb.name}] {self.APP_NAME}: Loading popup visible after ad; "
+                            "waiting instead of tapping OK fallback"
+                        )
                         return
 
                     # Fallback: we just came back from ad, assume reward — tap OK position
