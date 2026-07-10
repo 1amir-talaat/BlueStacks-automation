@@ -1,6 +1,6 @@
 """Queue-based multi-instance batch orchestrator.
 
-Keys 1 / 2 in the TUI start this runner with concurrency 1 or 2:
+Keys 1-6 in the TUI start this runner with concurrency 1 to 6:
   - Fill up to N BlueStacks instances at a time
   - Run full ad automation on each until the worker exits
   - Tear down the finished VM and start the next pending instance

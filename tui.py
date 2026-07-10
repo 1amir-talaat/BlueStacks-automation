@@ -206,11 +206,8 @@ class AutomationTUI:
         if key == "z":
             self.submit_action("open multi-instance manager", self.bs_manager.open_multi_instance_manager)
             return
-        if key == "2":
-            self.start_batch(2)
-            return
-        if key == "1":
-            self.start_batch(1)
+        if key in ("1", "2", "3", "4", "5", "6"):
+            self.start_batch(int(key))
             return
         if key == "0":
             if self.batch_runner.active:
@@ -830,8 +827,7 @@ class AutomationTUI:
             ("e/f", "export logs"),
             ("j/k", "select BS"),
             ("m/h", "start BS/all"),
-            ("1", "batch 1-at-a-time"),
-            ("2", "batch 2-at-a-time"),
+            ("1-6", "batch N-at-a-time"),
             ("0", "stop batch"),
             ("z", "multi-instance mgr"),
             ("d/c", "discover/connect"),
@@ -853,7 +849,7 @@ class AutomationTUI:
         text.append(f" {self.log_mode}", style=THEME["purple"])
         text.append("   ")
         text.append(" SHORTCUTS ", style=f"bold #020617 on {THEME['cyan']}")
-        text.append(" 1/2 batch  0 stop batch  m start BS  q quit", style=THEME["cyan"])
+        text.append(" 1-6 batch  0 stop batch  m start BS  q quit", style=THEME["cyan"])
         return Panel(text, border_style=THEME["border"], box=box.ROUNDED)
 
     def key_hint(self, key: str, label: str) -> Text:
