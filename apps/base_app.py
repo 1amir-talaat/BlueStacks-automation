@@ -1,3 +1,4 @@
+import os
 import time
 from enum import Enum
 from automation.adb_controller import ADBController
@@ -134,10 +135,11 @@ class BaseApp:
         img = self.screen.take_screenshot("detect", force=True)
         if not img:
             return None
-        from pathlib import Path
-        debug_dir = Path("screenshots/debug")
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        img.save(debug_dir / f"{self.adb.name}_latest.png")
+        if os.getenv("BLUESTACKS_SAVE_DEBUG_SCREENSHOTS") == "1":
+            from pathlib import Path
+            debug_dir = Path("screenshots/debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            img.save(debug_dir / f"{self.adb.name}_latest.png")
         frame = self.screen.screenshot_to_cv2(img)
         gc.collect()
         return frame
@@ -1068,35 +1070,32 @@ class BaseApp:
         return True
 
     def _guarded_watch_now_taps(self, x: int, y: int, tap_count: int) -> str:
-        """Tap Watch Now quickly, but stop as soon as the ad/redirect opens."""
-        for index in range(tap_count):
-            self.adb.tap(x, y)
-            if index == tap_count - 1:
-                return "tapped"
+        """Send one fast Watch Now burst, then inspect the result once."""
+        self.adb.tap_many(x, y, count=tap_count, delay=0.05)
+        self.watch_now_clicks += tap_count
+        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Watch Now burst sent x{tap_count}")
 
-            time.sleep(0.12)
-            focus_state = self._focus_state()
-            if focus_state == "ad":
-                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad opened after Watch Now tap {index + 1}/{tap_count}")
-                return "ad"
-            if focus_state in ("google_play", "browser"):
-                logger.info(f"[{self.adb.name}] {self.APP_NAME}: Redirect opened after Watch Now tap {index + 1}/{tap_count}")
-                return focus_state
-            if focus_state != "ours":
-                return focus_state
+        time.sleep(0.2)
+        focus_state = self._focus_state()
+        if focus_state == "ad":
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad opened after Watch Now burst")
+            return "ad"
+        if focus_state in ("google_play", "browser"):
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Redirect opened after Watch Now burst")
+            return focus_state
+        if focus_state != "ours":
+            return focus_state
 
-            frame = self._get_frame()
-            if frame is None:
-                return "unknown"
-            if self._dismiss_in_app_redirect_overlay(frame):
-                return "ad"
-            if self._find_button(frame, ["watch_now"], threshold=0.65):
-                continue
-            if self._find_daily_limit_button(frame):
-                return "daily_limit"
-            return "ad_page_changed"
-
-        return "tapped"
+        frame = self._get_frame()
+        if frame is None:
+            return "unknown"
+        if self._dismiss_in_app_redirect_overlay(frame):
+            return "ad"
+        if self._find_daily_limit_button(frame):
+            return "daily_limit"
+        if self._find_button(frame, ["watch_now"], threshold=0.65):
+            return "tapped"
+        return "ad_page_changed"
 
     def _tap_watch_now(self, tap_count: int = 1) -> bool | str:
         """Tap Watch Now only when its app-specific template is confidently visible."""

@@ -103,11 +103,18 @@ class ADBController:
 
     def tap_many(self, x: int, y: int, count: int = 5, delay: float = 0.05):
         """Send several taps in one shell call to avoid per-tap ADB startup cost."""
-        delay_cmd = ""
-        if delay > 0:
-            delay_cmd = f"; sleep {delay}"
-        command = "; ".join([f"input tap {x} {y}{delay_cmd}" for _ in range(count)])
-        self.shell(command, timeout=6)
+        count = max(1, int(count))
+        x = int(x)
+        y = int(y)
+
+        commands = []
+        for index in range(count):
+            commands.append(f"input tap {x} {y}")
+            if delay > 0 and index < count - 1:
+                commands.append(f"sleep {delay:g}")
+
+        timeout = max(4, int(count * (delay + 0.35)) + 3)
+        self.shell("; ".join(commands), timeout=timeout)
         logger.debug(f"[{self.name}] Tap many ({x}, {y}) x{count}")
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration: int = 300):
