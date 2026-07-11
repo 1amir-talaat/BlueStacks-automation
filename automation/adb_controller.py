@@ -164,12 +164,32 @@ class ADBController:
     def get_focused_activity(self) -> str:
         """Get the full package/activity of the current focus. ~10ms."""
         result = self._run(["-s", self.device_id, "shell", "dumpsys", "window", "windows"])
-        for line in result.stdout.splitlines():
+        return self._extract_focused_activity(result.stdout)
+
+    @staticmethod
+    def _extract_focused_activity(output: str) -> str:
+        """Extract the focused package/activity from dumpsys window output."""
+        for line in output.splitlines():
             if "mCurrentFocus" in line:
                 match = re.search(r'u0 ([^\s}]+)', line)
                 if match:
                     return match.group(1)
         return ""
+
+    def tap_and_get_focused_activity(self, x: int, y: int, settle: float = 0.06) -> str:
+        """Tap once, then read focus in the same device shell session.
+
+        This lets callers stop a rapid tap sequence before a newly opened ad
+        receives another tap, without paying for a second ADB process per click.
+        """
+        settle = max(0.0, float(settle))
+        output = self.shell(
+            f"input tap {int(x)} {int(y)}; sleep {settle:g}; dumpsys window windows",
+            timeout=4,
+        )
+        activity = self._extract_focused_activity(output)
+        logger.debug(f"[{self.name}] Tap ({int(x)}, {int(y)}) then focus: {activity or 'unknown'}")
+        return activity
 
     def is_focus_on(self, package: str) -> bool:
         """Check if the focused window belongs to the given package. ~10ms."""

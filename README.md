@@ -9,7 +9,7 @@ Automate daily ad-watching tasks across multiple BlueStacks instances to farm co
 - Handles ad popups (close button, Google Play redirects, "Continue" prompts)
 - Detects ad completion and claims rewards
 - Loops through ~15 ads per app per day
-- Switches apps when one stops giving rewards
+- Resets Google Advertising ID as a fallback when an app exhausts its batch, then switches apps only if recovery fails
 - Changes system date to reset daily limits
 
 ## Requirements

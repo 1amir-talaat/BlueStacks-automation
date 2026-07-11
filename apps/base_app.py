@@ -28,6 +28,7 @@ class BaseApp:
     ACTIVITY_NAME = ""
     APP_NAME = ""
     IS_DARK = False
+    AD_RESET_COOLDOWN_SECONDS = 15 * 60
 
     def __init__(self, adb: ADBController):
         self.adb = adb
@@ -784,6 +785,7 @@ class BaseApp:
             # Already in ad — wait for it
             if state == AppState.AD_PLAYING:
                 result = self.handle_ad_result()
+                result = self._maybe_reset_after_terminal_result(result)
                 if self.should_stop() or result == "stopped":
                     return "stopped"
                 if result:
@@ -793,6 +795,7 @@ class BaseApp:
             # Daily limit dialog
             if state == AppState.DAILY_LIMIT:
                 result = self.handle_daily_limit()
+                result = self._maybe_reset_after_terminal_result(result)
                 if self.should_stop() or result == "stopped":
                     return "stopped"
                 if result:
@@ -876,9 +879,10 @@ class BaseApp:
                     if self._interruptible_sleep(1):
                         return "stopped"
                 result = self._aggressive_watch_now()
+                result = self._maybe_reset_after_terminal_result(result)
                 if self.should_stop() or result == "stopped":
                     return "stopped"
-                if result in ("switch_app", "date_trick_blocked"):
+                if result:
                     return result
             else:
                 # Unknown state — retry navigation on next loop. Do not press BACK here;
@@ -897,10 +901,12 @@ class BaseApp:
         count = self.failed_ad_load_batches
         logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Failed ad-load batch #{count}")
 
-        if count >= 15:
-            logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Failed ad-load threshold reached; switching app")
+        if count >= 4:
+            logger.warning(
+                f"[{self.adb.name}] {self.APP_NAME}: Failed ad-load threshold reached; "
+                "attempting Google Advertising ID reset"
+            )
             self.failed_ad_load_batches = 0
-            self._ad_reset_attempted_at = 0
             return "switch_app"
 
         if count % 2 == 0:
@@ -931,67 +937,141 @@ class BaseApp:
         self.date_trick_offset_days = 1 if offset >= 10 else offset + 1
         return True
 
-    def _reset_ad_environment(self):
-        """Best-effort ad reset without root or destructive Google account changes."""
-        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Attempting ad environment reset")
-        if self._reset_google_ad_id():
-            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Google Advertising ID reset attempted")
-        else:
-            logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Google Advertising ID reset UI not available; using fallback reset")
+    def _maybe_reset_after_terminal_result(self, result: str | None) -> str | None:
+        if result not in ("switch_app", "date_trick_blocked"):
+            return result
 
+        logger.warning(
+            f"[{self.adb.name}] {self.APP_NAME}: {result} received; "
+            "trying Google Advertising ID reset before leaving the loop"
+        )
+        if self._reset_ad_environment(reason=result):
+            return None
+        return result
+
+    def _reset_ad_environment(self, reason: str = "terminal ad state") -> bool:
+        """Best-effort ad reset without root or destructive Google account changes."""
+        now = time.time()
+        if self._ad_reset_attempted_at and now - self._ad_reset_attempted_at < self.AD_RESET_COOLDOWN_SECONDS:
+            remaining = int(self.AD_RESET_COOLDOWN_SECONDS - (now - self._ad_reset_attempted_at))
+            logger.info(
+                f"[{self.adb.name}] {self.APP_NAME}: Skipping Google Advertising ID reset; "
+                f"last attempt {remaining}s ago"
+            )
+            return False
+
+        self._ad_reset_attempted_at = now
+        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Attempting ad environment reset after {reason}")
+
+        reset_ok = self._reset_google_ad_id()
+        if reset_ok:
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: Google Advertising ID reset confirmed")
+        else:
+            logger.warning(
+                f"[{self.adb.name}] {self.APP_NAME}: Google Advertising ID reset UI not available; "
+                "continuing with cleanup fallback"
+            )
+
+        # Leave the settings flow and clear any Google/Play state before relaunching.
+        self.adb.press_key("BACK")
+        time.sleep(0.8)
         self.adb.close_app("com.android.vending")
         self.adb.shell("am force-stop com.google.android.gms")
         self.adb.shell("am force-stop com.google.android.gsf")
+
+        self.failed_ad_load_batches = 0
+        self.post_ad_loading_retries = 0
+        self._in_post_ad_retry = False
+        self._last_loading_seen_at = 0
+        self._daily_limit_grace_until = 0
+        self._post_ad_grace_until = 0
+        self._last_reward_x = None
+
+        if self.should_stop():
+            return False
+
         self.force_restart()
-        self.go_to_ad_page()
+        if not self.go_to_ad_page():
+            logger.warning(
+                f"[{self.adb.name}] {self.APP_NAME}: Could not return to ad page immediately after reset; "
+                "continuing with the normal loop"
+            )
+        return reset_ok
 
     def _reset_google_ad_id(self) -> bool:
-        """Open Google Ads settings and reset the Advertising ID via UI text."""
-        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Opening Google Ads settings")
+        """Open Google Play services ads privacy and reset the Advertising ID."""
+        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Opening Google Play services ads privacy")
 
-        self.adb.shell("am start -a com.google.android.gms.ads.settings.ADS_SETTINGS")
-        time.sleep(2)
+        gms_path = self.adb.shell("pm path com.google.android.gms", timeout=8)
+        if not gms_path:
+            logger.warning(
+                f"[{self.adb.name}] {self.APP_NAME}: Google Play services is not installed; "
+                "Advertising ID reset provider unavailable"
+            )
+            return False
 
-        if not self.adb.tap_ui_text([
+        reset_texts = [
             "reset advertising id",
-            "reset advertising ID",
+            "delete advertising id",
             "reset ad id",
+            "delete ad id",
             "reset",
-        ], timeout=6):
-            self.adb.shell("am start -n com.google.android.gms/com.google.android.gms.ads.settings.AdsSettingsActivity")
-            time.sleep(2)
-            if not self.adb.tap_ui_text([
-                "reset advertising id",
-                "reset advertising ID",
-                "reset ad id",
-                "reset",
-            ], timeout=6):
-                return False
+            "delete",
+        ]
+        confirm_texts = ["ok", "confirm", "yes"]
 
-        time.sleep(1)
-        self.adb.tap_ui_text(["ok", "reset", "confirm"], timeout=4)
-        time.sleep(1)
-        self.adb.press_key("BACK")
-        time.sleep(1)
-        return True
+        launch_commands = [
+            "am start -W -a com.google.android.gms.settings.ADS_PRIVACY",
+            "am start -W -n com.google.android.gms/.adid.settings.AdsSettingsActivity",
+        ]
+
+        for command in launch_commands:
+            self.adb.shell(command, timeout=8)
+            time.sleep(2)
+            if self.adb.tap_ui_text(reset_texts, timeout=6):
+                time.sleep(1)
+                if self.adb.tap_ui_text(confirm_texts, timeout=4):
+                    time.sleep(1)
+                    return True
+
+                # Some Play-services versions apply the reset immediately and
+                # return to the app without showing a confirmation dialog.
+                activity = self.adb.get_focused_activity()
+                if "com.google.android.gms" not in activity:
+                    logger.info(
+                        f"[{self.adb.name}] {self.APP_NAME}: Advertising ID reset submitted "
+                        "without a confirmation dialog"
+                    )
+                    return True
+
+                logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Reset confirmation dialog not found")
+                continue
+
+        return False
 
     def _focus_state(self) -> str:
         """Classify current focused window: ours, ad, google_play, browser, or other."""
-        activity = self.adb.get_focused_activity()
+        return self._focus_state_from_activity(self.adb.get_focused_activity())
+
+    def _focus_state_from_activity(self, activity: str) -> str:
+        """Classify a focused activity string without issuing another ADB command."""
         if not activity:
             return "other"
+        activity_lower = activity.lower()
+        if "adactivity" in activity_lower or "com.google.android.gms.ads" in activity_lower:
+            return "ad"
         if self.PACKAGE_NAME in activity:
             # Ad runs inside our app (AdActivity) — treat as ad playing
-            if "AdActivity" in activity or "ads" in activity.lower():
+            if "ads" in activity_lower:
                 return "ad"
             return "ours"
-        if "com.android.vending" in activity or "phonesky" in activity.lower():
+        if "com.android.vending" in activity or "phonesky" in activity_lower:
             return "google_play"
-        if "com.android.chrome" in activity or "browser" in activity.lower():
+        if "com.android.chrome" in activity or "browser" in activity_lower:
             return "browser"
         # Launcher and settings overlays are transient — treat as still "ours"
         # so we don't press BACK and break the current flow.
-        if "launcher" in activity.lower() or "settings" in activity.lower():
+        if "launcher" in activity_lower or "settings" in activity_lower:
             return "ours"
         return "other"
 
@@ -1009,6 +1089,7 @@ class BaseApp:
 
         # Check if we're back in our app
         if self.is_app_running():
+            self._wait_and_dismiss_in_app_redirect_overlay()
             return
 
         # If still not in our app, force-close the redirect app
@@ -1020,9 +1101,11 @@ class BaseApp:
         if not self.is_app_running():
             self.adb.launch_app(self.PACKAGE_NAME, self.ACTIVITY_NAME)
             time.sleep(3)
+            if self.is_app_running():
+                self._wait_and_dismiss_in_app_redirect_overlay()
 
     def _find_in_app_redirect_continue(self, frame) -> tuple[int, int] | None:
-        """Detect Play-style in-app redirect overlays with a top Continue-to-app bar."""
+        """Detect the GetSMS return overlay and its top-right Continue-to-app arrow."""
         import cv2
         import numpy as np
 
@@ -1032,27 +1115,52 @@ class BaseApp:
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # The overlay in the reported screenshot has a large Google-blue Install
-        # CTA near the bottom. This keeps the detector from firing on normal ads.
-        bottom = hsv[int(h * 0.82):int(h * 0.97), int(w * 0.05):int(w * 0.95)]
-        blue = cv2.inRange(bottom, np.array([95, 90, 90]), np.array([125, 255, 255]))
-        blue_pixels = cv2.countNonZero(blue)
-        if blue_pixels < int(w * h * 0.015):
-            return None
-
-        # The top bar is mostly white/light gray and contains a small blue arrow
-        # on the right. Tap the arrow area to return to the app immediately.
+        # This return page has a light header, a small blue GetSMS icon at left,
+        # and a separate blue arrow at right. Requiring both blue markers avoids
+        # mistaking an ordinary ad close button for the return overlay.
         top = hsv[0:int(h * 0.08), :]
         white = cv2.inRange(top, np.array([0, 0, 180]), np.array([180, 55, 255]))
-        if cv2.countNonZero(white) < int(w * h * 0.035):
+        if cv2.countNonZero(white) < int(w * h * 0.02):
+            return None
+
+        left_top = hsv[int(h * 0.015):int(h * 0.075), int(w * 0.10):int(w * 0.24)]
+        icon_blue = cv2.inRange(left_top, np.array([90, 80, 80]), np.array([130, 255, 255]))
+        if cv2.countNonZero(icon_blue) < 20:
             return None
 
         right_top = hsv[0:int(h * 0.08), int(w * 0.75):w]
-        arrow_blue = cv2.inRange(right_top, np.array([95, 80, 80]), np.array([125, 255, 255]))
+        arrow_blue = cv2.inRange(right_top, np.array([90, 80, 80]), np.array([130, 255, 255]))
         if cv2.countNonZero(arrow_blue) < 20:
             return None
 
-        return (int(w * 0.92), int(h * 0.035))
+        return (int(w * 0.925), int(h * 0.042))
+
+    def _wait_and_dismiss_in_app_redirect_overlay(self, loader_seconds: float = 5.0) -> bool:
+        """Let the return-page loader finish, then tap its Continue-to-app arrow."""
+        frame = self._get_frame()
+        if frame is None or not self._find_in_app_redirect_continue(frame):
+            return False
+
+        logger.info(
+            f"[{self.adb.name}] {self.APP_NAME}: GetSMS return overlay detected; "
+            f"waiting {loader_seconds:.0f}s for its loader"
+        )
+        if self._interruptible_sleep(loader_seconds):
+            return False
+
+        frame = self._get_frame()
+        target = self._find_in_app_redirect_continue(frame) if frame is not None else None
+        if not target:
+            logger.info(f"[{self.adb.name}] {self.APP_NAME}: GetSMS return overlay cleared while waiting")
+            return False
+
+        logger.info(
+            f"[{self.adb.name}] {self.APP_NAME}: GetSMS return overlay ready; "
+            f"tapping Continue to app at {target}"
+        )
+        self.adb.tap(*target)
+        self._interruptible_sleep(1)
+        return True
 
     def _dismiss_in_app_redirect_overlay(self, frame=None) -> bool:
         if frame is None:
@@ -1070,12 +1178,31 @@ class BaseApp:
         return True
 
     def _guarded_watch_now_taps(self, x: int, y: int, tap_count: int) -> str:
-        """Send one fast Watch Now burst, then inspect the result once."""
-        self.adb.tap_many(x, y, count=tap_count, delay=0.05)
-        self.watch_now_clicks += tap_count
-        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Watch Now burst sent x{tap_count}")
+        """Tap quickly, checking focus after every tap so an opened ad is untouched."""
+        sent = 0
+        for _ in range(max(1, int(tap_count))):
+            activity = self.adb.tap_and_get_focused_activity(x, y, settle=0.06)
+            sent += 1
+            self.watch_now_clicks += 1
 
-        time.sleep(0.2)
+            # An empty activity means the focus probe failed or is in transition.
+            # Stop the burst rather than risk another tap reaching the ad screen.
+            if not activity:
+                logger.info(
+                    f"[{self.adb.name}] {self.APP_NAME}: Watch Now burst stopped after "
+                    f"{sent} tap(s); focus is transitioning"
+                )
+                return "unknown"
+
+            focus_state = self._focus_state_from_activity(activity)
+            if focus_state != "ours":
+                logger.info(
+                    f"[{self.adb.name}] {self.APP_NAME}: Watch Now burst stopped after "
+                    f"{sent} tap(s); focus is {focus_state}"
+                )
+                return focus_state
+
+        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Watch Now guarded burst sent x{sent}")
         focus_state = self._focus_state()
         if focus_state == "ad":
             logger.info(f"[{self.adb.name}] {self.APP_NAME}: Ad opened after Watch Now burst")

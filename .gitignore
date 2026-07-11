@@ -26,6 +26,7 @@ env/
 .env
 .env.*
 !.env.example
+fleet_service/.env
 
 # Editor/OS files
 .vscode/
