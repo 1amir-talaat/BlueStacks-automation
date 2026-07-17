@@ -45,6 +45,7 @@ class BaseApp:
         self._last_reward_x = None
         self.stop_event = None
         self._daily_limit_grace_until = 0
+        self._daily_limit_loading_retries = 0
         self._post_ad_grace_until = 0
         self._started_at = 0
 
@@ -98,8 +99,8 @@ class BaseApp:
                 return False
             time.sleep(0.5)
             if self.is_app_running():
-                logger.info(f"[{self.adb.name}] {self.APP_NAME}: App is in foreground, waiting 10s for full load")
-                if self._interruptible_sleep(10):  # let splash/loading finish fully
+                logger.info(f"[{self.adb.name}] {self.APP_NAME}: App is in foreground, waiting 5s for full load")
+                if self._interruptible_sleep(5):  # let splash/loading finish fully
                     return False
                 return not self.should_stop()
         logger.warning(f"[{self.adb.name}] {self.APP_NAME}: App did not appear in foreground after 15s")
@@ -121,8 +122,8 @@ class BaseApp:
                 return
             time.sleep(0.5)
             if self.is_app_running():
-                logger.info(f"[{self.adb.name}] {self.APP_NAME}: App back in foreground after restart, waiting 10s")
-                self._interruptible_sleep(10)
+                logger.info(f"[{self.adb.name}] {self.APP_NAME}: App back in foreground after restart, waiting 5s")
+                self._interruptible_sleep(5)
                 return
         logger.warning(f"[{self.adb.name}] {self.APP_NAME}: App did not appear after restart")
 
@@ -711,27 +712,25 @@ class BaseApp:
                 cx, cy = result
                 logger.info(f"[{self.adb.name}] {self.APP_NAME}: Tapping dismiss button at ({cx},{cy})")
                 self.adb.tap(cx, cy)
-                time.sleep(1.5)
+                time.sleep(0.5)
                 dismissed = True
 
         if not dismissed:
             # Fallback: tap the configured OK position
             logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Could not find dismiss button — fallback tap")
             self.adb.tap(*self.OK_BTN)
-            time.sleep(1.5)
+            time.sleep(0.5)
 
         if not self._advance_fake_date("daily limit"):
             logger.error(f"[{self.adb.name}] {self.APP_NAME}: Date trick aborted; could not set fake date")
             return
 
         self._daily_limit_grace_until = time.time() + 45
+        self._daily_limit_loading_retries = 0
 
-        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Waiting 3s after fake-date change before retrying")
-        time.sleep(3)
-
-        # Do not press BACK here. On TempSMS home screen that opens the exit
-        # confirmation dialog. Daily-limit dismissal is handled explicitly above.
-        time.sleep(1)
+        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Retrying immediately after fake-date change")
+        if self._interruptible_sleep(0.5):
+            return "stopped"
 
         ads_this_cycle = 0
         max_ads_per_cycle = 3
@@ -753,7 +752,19 @@ class BaseApp:
                     if dl:
                         logger.info(f"[{self.adb.name}] {self.APP_NAME}: Daily limit reached again after date trick")
                         break
-                if self._interruptible_sleep(1):
+                    if ads_this_cycle and self._is_blocking_loading_dialog(frame):
+                        logger.info(
+                            f"[{self.adb.name}] {self.APP_NAME}: Loading after ad in daily-limit flow; "
+                            "advancing date before next Watch Now"
+                        )
+                        if not self._advance_fake_date("post-ad loading in daily-limit flow"):
+                            return "date_trick_blocked"
+                        self._daily_limit_grace_until = time.time() + 20
+                        self._daily_limit_loading_retries = 0
+                        if self._interruptible_sleep(0.5):
+                            return "stopped"
+                        continue
+                if self._interruptible_sleep(0.25):
                     return "stopped"
             else:
                 logger.warning(f"[{self.adb.name}] {self.APP_NAME}: Could not reach ad page after date trick")
@@ -813,11 +824,21 @@ class BaseApp:
                     continue
 
                 if time.time() < self._daily_limit_grace_until:
+                    self._daily_limit_loading_retries += 1
+                    if self._daily_limit_loading_retries >= 2 and self._loading_dialog_persisted(duration=6):
+                        logger.warning(
+                            f"[{self.adb.name}] {self.APP_NAME}: Loading stayed after daily-limit date change; "
+                            "treating fake-date flow as blocked"
+                        )
+                        self._daily_limit_grace_until = 0
+                        self._daily_limit_loading_retries = 0
+                        return "date_trick_blocked"
+
                     logger.info(
                         f"[{self.adb.name}] {self.APP_NAME}: Loading after daily-limit date change; "
-                        "waiting instead of switching app"
+                        f"waiting briefly ({self._daily_limit_loading_retries}/2)"
                     )
-                    if self._interruptible_sleep(3):
+                    if self._interruptible_sleep(2):
                         return "stopped"
                     self.go_to_ad_page()
                     continue
@@ -871,6 +892,7 @@ class BaseApp:
 
             # We should be on AD_PAGE now — try to click Watch Now aggressively
             if state == AppState.AD_PAGE:
+                self._daily_limit_loading_retries = 0
                 if self._in_post_ad_retry:
                     logger.info(f"[{self.adb.name}] {self.APP_NAME}: Changing date one more time before next Watch Now")
                     if not self._advance_fake_date("post-loading retry"):
@@ -984,6 +1006,7 @@ class BaseApp:
         self._in_post_ad_retry = False
         self._last_loading_seen_at = 0
         self._daily_limit_grace_until = 0
+        self._daily_limit_loading_retries = 0
         self._post_ad_grace_until = 0
         self._last_reward_x = None
 
@@ -1089,7 +1112,7 @@ class BaseApp:
 
         # Check if we're back in our app
         if self.is_app_running():
-            self._wait_and_dismiss_in_app_redirect_overlay()
+            self._handle_in_app_redirect_overlay()
             return
 
         # If still not in our app, force-close the redirect app
@@ -1102,10 +1125,10 @@ class BaseApp:
             self.adb.launch_app(self.PACKAGE_NAME, self.ACTIVITY_NAME)
             time.sleep(3)
             if self.is_app_running():
-                self._wait_and_dismiss_in_app_redirect_overlay()
+                self._handle_in_app_redirect_overlay()
 
     def _find_in_app_redirect_continue(self, frame) -> tuple[int, int] | None:
-        """Detect the GetSMS return overlay and its top-right Continue-to-app arrow."""
+        """Detect the ad return overlay and its top-right Continue-to-app arrow."""
         import cv2
         import numpy as np
 
@@ -1115,17 +1138,20 @@ class BaseApp:
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # This return page has a light header, a small blue GetSMS icon at left,
-        # and a separate blue arrow at right. Requiring both blue markers avoids
-        # mistaking an ordinary ad close button for the return overlay.
+        # This return page has a light header, app identity on the left, and a
+        # separate blue arrow at right. The left logo differs by app, so require
+        # non-empty app identity content instead of a specific icon color.
         top = hsv[0:int(h * 0.08), :]
         white = cv2.inRange(top, np.array([0, 0, 180]), np.array([180, 55, 255]))
         if cv2.countNonZero(white) < int(w * h * 0.02):
             return None
 
-        left_top = hsv[int(h * 0.015):int(h * 0.075), int(w * 0.10):int(w * 0.24)]
-        icon_blue = cv2.inRange(left_top, np.array([90, 80, 80]), np.array([130, 255, 255]))
-        if cv2.countNonZero(icon_blue) < 20:
+        left_top = frame[int(h * 0.015):int(h * 0.075), int(w * 0.10):int(w * 0.42)]
+        if left_top.size == 0:
+            return None
+        left_gray = cv2.cvtColor(left_top, cv2.COLOR_BGR2GRAY)
+        left_edges = cv2.Canny(left_gray, 50, 150)
+        if cv2.countNonZero(left_edges) < 45:
             return None
 
         right_top = hsv[0:int(h * 0.08), int(w * 0.75):w]
@@ -1162,20 +1188,15 @@ class BaseApp:
         self._interruptible_sleep(1)
         return True
 
-    def _dismiss_in_app_redirect_overlay(self, frame=None) -> bool:
+    def _handle_in_app_redirect_overlay(self, frame=None, loader_seconds: float = 5.0) -> bool:
+        """Handle the GetSMS ad return page with the top-right Continue-to-app arrow."""
         if frame is None:
             frame = self._get_frame()
-        if frame is None:
+        if frame is None or not self._find_in_app_redirect_continue(frame):
             return False
 
-        target = self._find_in_app_redirect_continue(frame)
-        if not target:
-            return False
-
-        logger.info(f"[{self.adb.name}] {self.APP_NAME}: In-app redirect overlay detected, tapping Continue to app at {target}")
-        self.adb.tap(*target)
-        time.sleep(1)
-        return True
+        logger.info(f"[{self.adb.name}] {self.APP_NAME}: Continue-to-app overlay visible; waiting for loader then tapping arrow")
+        return self._wait_and_dismiss_in_app_redirect_overlay(loader_seconds=loader_seconds)
 
     def _guarded_watch_now_taps(self, x: int, y: int, tap_count: int) -> str:
         """Tap quickly, checking focus after every tap so an opened ad is untouched."""
@@ -1216,7 +1237,7 @@ class BaseApp:
         frame = self._get_frame()
         if frame is None:
             return "unknown"
-        if self._dismiss_in_app_redirect_overlay(frame):
+        if self._handle_in_app_redirect_overlay(frame):
             return "ad"
         if self._find_daily_limit_button(frame):
             return "daily_limit"
@@ -1612,9 +1633,9 @@ class BaseApp:
 
             if focus_state == "ours":
                 frame = self._get_frame()
-                if frame is not None and self._is_in_app_ad_overlay(frame):
+                if frame is not None and self._handle_in_app_redirect_overlay(frame):
                     focus_state = "ad"
-                elif frame is not None and self._dismiss_in_app_redirect_overlay(frame):
+                elif frame is not None and self._is_in_app_ad_overlay(frame):
                     focus_state = "ad"
                 else:
                     # Back to our app — look for reward dialog
@@ -1687,7 +1708,7 @@ class BaseApp:
             if self.buttons.available:
                 frame = self._get_frame()
                 if frame is not None:
-                    if self._dismiss_in_app_redirect_overlay(frame):
+                    if self._handle_in_app_redirect_overlay(frame):
                         continue
 
                     # First only click explicit known skip/close templates.

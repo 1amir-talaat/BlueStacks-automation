@@ -442,7 +442,9 @@ class AutomationTUI:
     def reset_dates(self):
         if not self.manager:
             return
-        reset_online_dates(self.manager)
+        if not reset_online_dates(self.manager):
+            return "Date reset blocked: external API time could not be applied to every instance."
+        return "All online emulator clocks synchronized from external API time."
 
     def toggle_app(self):
         tracker = self.selected_tracker()

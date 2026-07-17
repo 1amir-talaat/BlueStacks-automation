@@ -256,18 +256,32 @@ class ADBController:
             logger.warning(f"[{self.name}] Could not read device epoch seconds: {value}")
             return None
 
-    def set_timezone(self, timezone: str) -> None:
+    def set_timezone(self, timezone: str, offset_seconds: int | None = None) -> str:
         """Best-effort timezone update for Android/BlueStacks."""
         self.shell("settings put global auto_time_zone 0")
-        self.shell(f"cmd alarm set-timezone {timezone}")
-        self.shell(f"setprop persist.sys.timezone {timezone}")
+        if offset_seconds is not None and offset_seconds % 3600 == 0:
+            # BlueStacks may have stale tzdata for Africa/Cairo. A fixed Etc/GMT
+            # zone keeps the displayed clock aligned with the API's DST offset.
+            hours = offset_seconds // 3600
+            emulator_timezone = f"Etc/GMT{'-' if hours >= 0 else '+'}{abs(hours)}"
+        else:
+            emulator_timezone = timezone
+        self.shell(f"cmd alarm set-timezone {emulator_timezone}")
+        self.shell(f"setprop persist.sys.timezone {emulator_timezone}")
+        return emulator_timezone
 
-    def restore_time(self, epoch_seconds: int, timezone: str = "Africa/Cairo", expected_date: str | None = None):
+    def restore_time(
+        self,
+        epoch_seconds: int,
+        timezone: str = "Africa/Cairo",
+        expected_date: str | None = None,
+        offset_seconds: int | None = None,
+    ):
         """Restore the emulator to an exact API-provided timestamp and timezone."""
         epoch_ms = epoch_seconds * 1000
 
         self.shell("settings put global auto_time 0")
-        self.set_timezone(timezone)
+        emulator_timezone = self.set_timezone(timezone, offset_seconds)
         cmd = f"cmd alarm set-time {epoch_ms}"
 
         for attempt in range(3):
@@ -276,43 +290,34 @@ class ADBController:
 
             actual_epoch = self.get_epoch_seconds()
             actual_date = self.get_date()
+            actual_offset = (self.shell("date +%z") or "").strip()
             date_ok = expected_date is None or actual_date == expected_date
             time_ok = actual_epoch is not None and abs(actual_epoch - epoch_seconds) <= 120
-            if date_ok and time_ok:
-                logger.info(f"[{self.name}] Time restored to {actual_date} {timezone} (cmd: {cmd})")
+            expected_offset = None
+            if offset_seconds is not None:
+                sign = "+" if offset_seconds >= 0 else "-"
+                absolute = abs(offset_seconds)
+                expected_offset = f"{sign}{absolute // 3600:02d}{(absolute % 3600) // 60:02d}"
+            offset_ok = expected_offset is None or actual_offset == expected_offset
+            if date_ok and time_ok and offset_ok:
+                logger.info(
+                    f"[{self.name}] Time restored to {actual_date} {actual_offset} "
+                    f"(API timezone {timezone}, emulator timezone {emulator_timezone}; cmd: {cmd})"
+                )
                 return True
             logger.warning(
                 f"[{self.name}] Time restore attempt {attempt + 1}/3 failed: "
                 f"expected_epoch={epoch_seconds}, actual_epoch={actual_epoch}, "
-                f"expected_date={expected_date}, actual_date={actual_date}"
+                f"expected_date={expected_date}, actual_date={actual_date}, "
+                f"expected_offset={expected_offset}, actual_offset={actual_offset}"
             )
 
         logger.error(f"[{self.name}] Failed to restore API time after 3 attempts")
         return False
 
     def restore_date(self, date_str: str):
-        """Restore the emulator to a real date using the host PC's current time."""
-        now = datetime.datetime.now()
-        target = datetime.datetime.fromisoformat(date_str).replace(
-            hour=now.hour,
-            minute=now.minute,
-            second=now.second,
-        )
-        epoch_ms = int(target.timestamp() * 1000)
-
-        self.shell("settings put global auto_time 0")
-        self.shell("settings put global auto_time_zone 0")
-        cmd = f"cmd alarm set-time {epoch_ms}"
-        self.shell(cmd)
-        time.sleep(0.5)
-
-        actual = self.get_date()
-        if actual != date_str:
-            logger.error(f"[{self.name}] Failed to restore date to {date_str}; actual={actual}; cmd={cmd}")
-            return False
-
-        logger.info(f"[{self.name}] Date restored to {date_str} (cmd: {cmd})")
-        return True
+        """Set only the calendar date, preserving the emulator's current time."""
+        return self.set_date(date_str)
 
     def set_date(self, date_str: str):
         """Set the emulator date. date_str must be YYYY-MM-DD."""
@@ -339,15 +344,16 @@ class ADBController:
         # persist. Android's alarm service setter does persist for this emulator.
         cmd = f"cmd alarm set-time {epoch_ms}"
 
-        # Retry up to 3 times — alarm service may need time to take effect
+        # Retry up to 3 times; poll quickly because BlueStacks often applies this immediately.
         for attempt in range(3):
             self.shell(cmd)
-            time.sleep(1.5)
-
-            actual = self.get_date()
-            if actual == date_str:
-                logger.info(f"[{self.name}] Date verified as {date_str} (cmd: {cmd})")
-                return True
+            actual = ""
+            for _ in range(5):
+                time.sleep(0.25)
+                actual = self.get_date()
+                if actual == date_str:
+                    logger.info(f"[{self.name}] Date verified as {date_str} (cmd: {cmd})")
+                    return True
             logger.warning(f"[{self.name}] Date set attempt {attempt + 1}/3: expected {date_str}, got {actual}")
 
         logger.error(f"[{self.name}] Failed to set date to {date_str} after 3 attempts; actual={actual}")

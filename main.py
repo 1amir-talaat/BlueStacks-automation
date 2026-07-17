@@ -25,7 +25,10 @@ def run_legacy():
         return
 
     manager.print_status()
-    reset_online_dates(manager, online)
+    if not reset_online_dates(manager, online):
+        logger.error("Stopping startup because one or more emulator clocks could not be synchronized from an API")
+        manager.disconnect_all()
+        return
 
     for tracker in [manager.get(name) for name, ok in online.items() if ok]:
         if tracker.app:
