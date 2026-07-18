@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(code-review)",
+      "Bash(git -C /d/my-projects/BlueStacks-automation status --short)",
+      "Bash(git -C /d/my-projects/BlueStacks-automation rev-parse --show-toplevel)",
+      "Bash(git -C 'D:/my-projects/BlueStacks-automation' status --short)",
+      "Bash(git -C 'D:/my-projects/BlueStacks-automation' diff --stat)",
+      "Bash(git -C 'D:/my-projects/BlueStacks-automation' diff HEAD)",
+      "Bash(git diff *)"
+    ]
+  }
+}

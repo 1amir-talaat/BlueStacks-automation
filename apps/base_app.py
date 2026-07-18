@@ -732,9 +732,9 @@ class BaseApp:
         if self._interruptible_sleep(0.5):
             return "stopped"
 
+        max_ads_per_cycle = 20
         ads_this_cycle = 0
-        max_ads_per_cycle = 3
-        while ads_this_cycle < max_ads_per_cycle:
+        while True:
             if self.should_stop():
                 return "stopped"
             if self.go_to_ad_page():
@@ -745,7 +745,23 @@ class BaseApp:
                     return result
                 if self.ads_watched > ads_before:
                     ads_this_cycle += self.ads_watched - ads_before
-                # Check if daily limit appeared again — that means this fake date is exhausted
+                    # Each fake date provides one extra ad. Change it as soon as
+                    # the reward is collected, before the next Watch Now tap can
+                    # reopen the daily-limit dialog.
+                    logger.info(
+                        f"[{self.adb.name}] {self.APP_NAME}: Ad collected in daily-limit flow; "
+                        "advancing date before next Watch Now"
+                    )
+                    if not self._advance_fake_date("post-ad in daily-limit flow"):
+                        return "date_trick_blocked"
+                    self._daily_limit_grace_until = time.time() + 20
+                    self._daily_limit_loading_retries = 0
+                    if self._interruptible_sleep(0.5):
+                        return "stopped"
+                    continue
+
+                # No ad was collected, so preserve the existing safeguard for a
+                # limit dialog or loading state that appeared during this attempt.
                 frame = self._get_frame()
                 if frame is not None:
                     dl = self._find_daily_limit_button(frame)
@@ -960,7 +976,9 @@ class BaseApp:
         return True
 
     def _maybe_reset_after_terminal_result(self, result: str | None) -> str | None:
-        if result not in ("switch_app", "date_trick_blocked"):
+        # A persistent loading dialog is an app/date failure, not an ad-ID
+        # failure. Let runtime switch apps so both blocked apps can terminate.
+        if result != "switch_app":
             return result
 
         logger.warning(

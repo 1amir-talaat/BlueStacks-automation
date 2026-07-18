@@ -299,7 +299,12 @@ class ADBController:
                 absolute = abs(offset_seconds)
                 expected_offset = f"{sign}{absolute // 3600:02d}{(absolute % 3600) // 60:02d}"
             offset_ok = expected_offset is None or actual_offset == expected_offset
-            if date_ok and time_ok and offset_ok:
+            if date_ok and time_ok:
+                if not offset_ok:
+                    logger.warning(
+                        f"[{self.name}] Emulator kept timezone offset {actual_offset} instead of "
+                        f"{expected_offset}; accepting the verified API timestamp and date"
+                    )
                 logger.info(
                     f"[{self.name}] Time restored to {actual_date} {actual_offset} "
                     f"(API timezone {timezone}, emulator timezone {emulator_timezone}; cmd: {cmd})"
